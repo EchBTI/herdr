@@ -998,6 +998,10 @@ fn print_session_help() {
     eprintln!("herdr session commands:");
     eprintln!("  herdr session list [--json]");
     eprintln!("  herdr session attach <name>");
+    eprintln!("  herdr session attach --shared-owner USER --shared-session NAME");
+    eprintln!("  herdr --session NAME session share enable --group GROUP");
+    eprintln!("  herdr --session NAME session share disable|status");
+    eprintln!("  herdr --session NAME session access [--json]");
     eprintln!("  herdr session stop <name> [--json]");
     eprintln!("  herdr session delete <name> [--json]");
     eprintln!("  use 'default' as <name> to target the default session for stop");

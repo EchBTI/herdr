@@ -17,6 +17,14 @@ use crate::layout::PaneId;
 pub struct TerminalRuntime(crate::pane::PaneRuntime);
 
 impl TerminalRuntime {
+    pub(crate) fn isolated_execution(&self) -> bool {
+        self.0.isolated_execution()
+    }
+    #[cfg(test)]
+    pub(crate) fn test_mark_isolated(&mut self) {
+        self.0.test_mark_isolated();
+    }
+
     pub fn shutdown(self) {
         self.0.shutdown();
     }

@@ -33,5 +33,6 @@ pub(super) enum ClientLoopEvent {
         /// latest target have the same identity after restoration.
         force: bool,
     },
+    OwnerSpaceAccess,
     Timer,
 }

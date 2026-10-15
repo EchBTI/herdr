@@ -4,6 +4,17 @@ use super::*;
 pub(crate) struct ClientGraphicsCheckpoint(crate::kitty_graphics::surface::ClientState);
 
 impl ClientShellState {
+    #[cfg(unix)]
+    pub(crate) fn suspend_graphics(&mut self) -> crate::kitty_graphics::GraphicsOutput {
+        self.graphics.encode_output(
+            crate::kitty_graphics::surface::Visibility::Hidden,
+            (0, 0),
+            None,
+            self.graphics_cell_size,
+            &crate::kitty_graphics::surface::Occlusion::default(),
+        )
+    }
+
     #[cfg(all(test, unix))]
     pub(crate) fn graphics_scope(&self) -> &str {
         self.graphics.scope()

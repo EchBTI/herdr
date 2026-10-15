@@ -368,6 +368,7 @@ pub(super) fn render_mobile_switcher(
     active_endpoint_id: &ClientEndpointId,
     config: &ClientShellConfig,
     selected_workspace_id: Option<&WorkspaceNavigationTarget>,
+    owner_space_access: bool,
     scroll: &mut usize,
     reveal_workspace: &mut bool,
     hits: &mut ShellHitMap,
@@ -442,6 +443,7 @@ pub(super) fn render_mobile_switcher(
         active_endpoint_id,
         config,
         selected_workspace_id,
+        owner_space_access,
         viewport.width.saturating_sub(1),
     );
     let total_rows = items.iter().map(|item| item.lines.len()).sum::<usize>();
@@ -578,6 +580,7 @@ fn mobile_items(
     active_endpoint_id: &ClientEndpointId,
     config: &ClientShellConfig,
     selected_workspace_id: Option<&WorkspaceNavigationTarget>,
+    owner_space_access: bool,
     content_width: u16,
 ) -> Vec<MobileItem> {
     let palette = &config.palette;
@@ -924,9 +927,10 @@ fn mobile_items(
     }
 
     items.push(MobileItem::section("menu", palette));
-    for (index, (label, _)) in super::global_menu::global_menu_items(snapshot)
-        .into_iter()
-        .enumerate()
+    for (index, (label, _)) in
+        super::global_menu::global_menu_items_with_access(snapshot, owner_space_access)
+            .into_iter()
+            .enumerate()
     {
         items.push(MobileItem {
             lines: vec![Line::from(Span::styled(
@@ -1070,12 +1074,15 @@ impl ClientShellState {
             }
             Some(ClientMobileTarget::Menu(index)) => {
                 let actionable = self.snapshot.as_deref().is_some_and(|snapshot| {
-                    super::global_menu::global_menu_items(snapshot)
-                        .get(index)
-                        .is_some_and(|(_, action)| {
-                            *action != super::global_menu::ClientGlobalMenuAction::WhatsNew
-                                || snapshot.release_notes.is_some()
-                        })
+                    super::global_menu::global_menu_items_with_access(
+                        snapshot,
+                        self.owner_space_access_available(),
+                    )
+                    .get(index)
+                    .is_some_and(|(_, action)| {
+                        *action != super::global_menu::ClientGlobalMenuAction::WhatsNew
+                            || snapshot.release_notes.is_some()
+                    })
                 });
                 if actionable {
                     self.mobile_switcher_suspended = true;

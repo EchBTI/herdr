@@ -23,11 +23,14 @@ fn public_move(
 ) -> Result<PaneMoveResult, ErrorResponse> {
     let (respond_to, response_rx) = std::sync::mpsc::channel();
     server.handle_api_request_with_shutdown_check(crate::api::ApiRequestMessage {
+        native_shared: None,
+        native_client_id: None,
         request: crate::api::schema::Request {
             id: "move-pane".into(),
             method: crate::api::schema::Method::PaneMove(params),
         },
         respond_to,
+        shared_scope: None,
         response_write_complete: None,
     });
     let response = response_rx.recv().expect("pane move response");

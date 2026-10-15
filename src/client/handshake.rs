@@ -146,6 +146,7 @@ pub(crate) fn probe_endpoint_negotiation(
         false,
         false,
         false, // This probe uses an SSH bridge, not a shared filesystem.
+        false,
         &AtomicBool::new(false),
     )
     .map_err(io::Error::other)?;
@@ -181,6 +182,7 @@ pub(super) fn do_handshake(
     mouse_capture: bool,
     surface_active: bool,
     local_transport: bool,
+    shared_access: bool,
     stopped: &AtomicBool,
 ) -> Result<HandshakeResult, ClientError> {
     stream
@@ -191,6 +193,7 @@ pub(super) fn do_handshake(
     let hello = if let Some(surface_size) = shell_surface_size {
         let hello = EndpointClientHello {
             generation: ENDPOINT_PROTOCOL_GENERATION,
+            shared_access,
             cell_width_px,
             cell_height_px,
             surface_size,
@@ -439,6 +442,7 @@ mod tests {
                     false,
                     true,
                     true,
+                    false,
                     &AtomicBool::new(false),
                 );
                 peer.join().unwrap();

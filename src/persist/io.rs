@@ -5,7 +5,7 @@ use tracing::warn;
 
 use super::snapshot::{
     parse_history_snapshot, parse_snapshot, snapshot_file_version, SessionHistorySnapshot,
-    SessionSnapshot, SNAPSHOT_VERSION,
+    SessionSnapshot, MAX_SNAPSHOT_VERSION,
 };
 
 pub(super) fn session_path() -> PathBuf {
@@ -43,7 +43,22 @@ fn resolve_write_target(path: &Path) -> std::io::Result<PathBuf> {
 }
 
 pub(super) fn save_to_path(path: &Path, snapshot: &SessionSnapshot) -> std::io::Result<()> {
-    save_json_to_path(path, snapshot)
+    if snapshot.version > MAX_SNAPSHOT_VERSION {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "unsupported session snapshot version",
+        ));
+    }
+    // Offline worker enable writes this atomic format gate before the execution
+    // registry is enabled. Removing the last isolated workspace permits v3 again.
+    let mut document = serde_json::to_value(snapshot)?;
+    document["version"] = serde_json::json!(super::snapshot::session_format_version(
+        snapshot
+            .workspaces
+            .iter()
+            .any(|workspace| workspace.isolated_execution)
+    ));
+    save_json_to_path(path, &document)
 }
 
 fn save_json_to_path<T: serde::Serialize>(path: &Path, snapshot: &T) -> std::io::Result<()> {
@@ -114,10 +129,10 @@ pub fn load() -> Option<SessionSnapshot> {
         Ok(snapshot) => Some(snapshot),
         Err(err) => {
             if let Some(version) = snapshot_file_version(&content) {
-                if version > SNAPSHOT_VERSION {
+                if version > MAX_SNAPSHOT_VERSION {
                     warn!(
                         event = "persist.restore", subsystem = "persist", outcome = "unsupported_version",
-                        path = %path.display(), file_version = version, supported = SNAPSHOT_VERSION,
+                        path = %path.display(), file_version = version, supported = MAX_SNAPSHOT_VERSION,
                         "session file is from a newer herdr version, ignoring"
                     );
                     return None;
@@ -148,10 +163,10 @@ pub fn load_history() -> Option<SessionHistorySnapshot> {
         Ok(snapshot) => Some(snapshot),
         Err(err) => {
             if let Some(version) = snapshot_file_version(&content) {
-                if version > SNAPSHOT_VERSION {
+                if version > MAX_SNAPSHOT_VERSION {
                     warn!(
                         file_version = version,
-                        supported = SNAPSHOT_VERSION,
+                        supported = MAX_SNAPSHOT_VERSION,
                         "session history file is from a newer herdr version, ignoring"
                     );
                     return None;
@@ -167,7 +182,7 @@ pub fn load_history() -> Option<SessionHistorySnapshot> {
 mod tests {
     use super::*;
     use crate::persist::snapshot::{
-        PaneHistorySnapshot, TabHistorySnapshot, WorkspaceHistorySnapshot,
+        PaneHistorySnapshot, TabHistorySnapshot, WorkspaceHistorySnapshot, SNAPSHOT_VERSION,
     };
 
     fn temp_session_path(name: &str) -> PathBuf {
@@ -217,6 +232,44 @@ mod tests {
                 }],
             }],
         }
+    }
+
+    #[test]
+    fn isolated_session_version_gate_is_atomic_on_enable_and_disable() {
+        let path = temp_session_path("isolated-version-gate");
+        let workspace = crate::workspace::Workspace::test_new("versioned");
+        let mut snapshot = crate::persist::capture(
+            &[workspace],
+            &Default::default(),
+            &Default::default(),
+            Some(0),
+            0,
+        );
+        save_to_path(&path, &snapshot).unwrap();
+        assert_eq!(
+            snapshot_file_version(&std::fs::read_to_string(&path).unwrap()),
+            Some(3)
+        );
+        // Offline enable updates the flag on the existing v3 document.
+        snapshot.workspaces[0].isolated_execution = true;
+        save_to_path(&path, &snapshot).unwrap();
+        let isolated = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(snapshot_file_version(&isolated), Some(4));
+        assert!(parse_snapshot(&isolated).unwrap().workspaces[0].isolated_execution);
+        snapshot.version = 4;
+        snapshot.workspaces[0].isolated_execution = false;
+        save_to_path(&path, &snapshot).unwrap();
+        assert_eq!(
+            snapshot_file_version(&std::fs::read_to_string(&path).unwrap()),
+            Some(3)
+        );
+        snapshot.version = 5;
+        assert!(save_to_path(&path, &snapshot).is_err());
+        assert_eq!(
+            snapshot_file_version(&std::fs::read_to_string(&path).unwrap()),
+            Some(3)
+        );
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
     }
 
     #[test]

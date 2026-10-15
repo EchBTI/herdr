@@ -131,6 +131,8 @@ impl ClientShellLocation {
 
 /// A connected client tracked by the server.
 pub(crate) struct ClientConnection {
+    /// Verified shared-socket identity; absent only for owner-private sockets.
+    pub(crate) auth: Option<crate::shared::native_transport::NativePrincipal>,
     /// Whether this connection owns the Herdr shell or one direct terminal stream.
     pub(crate) mode: ClientConnectionMode,
     /// The client's terminal size after clamping.
@@ -224,6 +226,7 @@ impl ClientConnection {
         writer: Option<ClientWriter>,
     ) -> Self {
         Self {
+            auth: None,
             mode,
             terminal_size,
             cell_size,
@@ -471,14 +474,6 @@ impl ClientConnection {
     pub(crate) fn is_active_shell_client(&self) -> bool {
         self.is_shell_client() && self.shell_surface_active
     }
-}
-
-pub(crate) fn latest_shell_client(clients: &HashMap<u64, ClientConnection>) -> Option<u64> {
-    clients
-        .iter()
-        .filter(|(_, client)| client.is_active_shell_client())
-        .max_by_key(|(_, client)| client.last_activity)
-        .map(|(&client_id, _)| client_id)
 }
 
 pub(crate) fn terminal_stream_client_ids(

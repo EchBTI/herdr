@@ -11,6 +11,7 @@ const NESTED_HERDR_MESSAGES: [&str; 6] = [
     "recursion detected. base case not found. aborting.",
 ];
 
+mod access;
 mod agent_resume;
 mod agent_view_eval;
 mod api;
@@ -52,6 +53,7 @@ mod render_signal;
 mod selection;
 mod server;
 mod session;
+mod shared;
 mod sound;
 mod terminal;
 mod terminal_effects;
@@ -517,6 +519,9 @@ fn main() -> io::Result<()> {
             std::process::exit(2);
         }
     };
+    if let Some(result) = shared::maybe_run(&raw_args) {
+        return result;
+    }
     #[cfg(windows)]
     if let Some(result) = platform::maybe_activate_desktop_notification(&raw_args) {
         return result;

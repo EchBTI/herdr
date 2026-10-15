@@ -1354,6 +1354,9 @@ impl AppState {
                 continue;
             };
 
+            if self.workspaces[ws_idx].isolated_execution {
+                continue;
+            }
             if self.workspaces[ws_idx]
                 .resolved_identity_cwd_from(&self.terminals, terminal_runtimes)
                 .as_ref()

@@ -85,6 +85,12 @@ impl ClientContextMenuOverlay {
 
 impl ClientShellState {
     pub(super) fn open_workspace_context_menu(&mut self, workspace_id: String, x: u16, y: u16) {
+        if !self.shared_workspace_control(Some(&workspace_id)) {
+            self.receive_endpoint_unavailable(
+                "This space is View only; its context actions require Control access".into(),
+            );
+            return;
+        }
         let Some(snapshot) = self.snapshot.as_deref() else {
             return;
         };
@@ -131,6 +137,12 @@ impl ClientShellState {
         else {
             return;
         };
+        if !self.shared_workspace_control(Some(&tab.workspace_id)) {
+            self.receive_endpoint_unavailable(
+                "This space is View only; its context actions require Control access".into(),
+            );
+            return;
+        }
         self.overlay = Some(ClientShellOverlay::ContextMenu(ClientContextMenuOverlay {
             target: ClientContextMenuTarget::Tab {
                 tab_id,
@@ -149,6 +161,12 @@ impl ClientShellState {
         let Some(pane) = snapshot.panes.iter().find(|pane| pane.pane_id == pane_id) else {
             return;
         };
+        if !self.shared_workspace_control(Some(&pane.workspace_id)) {
+            self.receive_endpoint_unavailable(
+                "This space is View only; its context actions require Control access".into(),
+            );
+            return;
+        }
         let source_pane_id = snapshot
             .focused_pane_id
             .clone()

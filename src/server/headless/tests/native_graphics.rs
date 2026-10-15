@@ -1148,7 +1148,8 @@ async fn native_file_render_scale_profile() {
             times.sort_unstable();
             println!(
                 "native_file_render_scale retained=true native_files={native} source_retention={source_retention} viewport=160x48 populated_panes={count} changing_images=1 image=800x480 warmup={WARMUP} samples={SAMPLES} median_us={} p95_us={}",
-                times[SAMPLES / 2].as_micros(), times[SAMPLES * 95 / 100].as_micros(),
+                times[SAMPLES / 2].as_micros(),
+                times[SAMPLES * 95 / 100].as_micros(),
             );
             shutdown_test_runtimes(&mut server);
             drop(server);

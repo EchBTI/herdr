@@ -2436,6 +2436,48 @@ mod tests {
     }
 
     #[test]
+    fn isolated_new_terminal_cwd_ignores_owner_policy_and_follows_only_project() {
+        let mut app = test_app();
+        let mut workspace = Workspace::test_new("isolated-cwd");
+        workspace.isolated_execution = true;
+        workspace.identity_cwd = "/project".into();
+        app.state.workspaces = vec![workspace];
+        for policy in [
+            crate::config::NewTerminalCwdConfig::Home,
+            crate::config::NewTerminalCwdConfig::Current,
+            crate::config::NewTerminalCwdConfig::Path("/outside".into()),
+        ] {
+            app.state.new_terminal_cwd = policy;
+            assert_eq!(
+                app.resolve_new_terminal_cwd_in_workspace(0, Some("/project/subdir".into())),
+                std::path::PathBuf::from("/project/subdir")
+            );
+            for follow in [
+                None,
+                Some("/outside".into()),
+                Some("/project/../outside".into()),
+            ] {
+                assert_eq!(
+                    app.resolve_new_terminal_cwd_in_workspace(0, follow),
+                    std::path::PathBuf::from("/project")
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn ordinary_new_terminal_cwd_keeps_owner_policy() {
+        let mut app = test_app();
+        app.state.workspaces = vec![Workspace::test_new("ordinary-cwd")];
+        app.state.new_terminal_cwd =
+            crate::config::NewTerminalCwdConfig::Path("/configured".into());
+        assert_eq!(
+            app.resolve_new_terminal_cwd_in_workspace(0, Some("/project/subdir".into())),
+            std::path::PathBuf::from("/configured")
+        );
+    }
+
+    #[test]
     fn new_terminal_cwd_follow_uses_source_cwd() {
         let cwd = creation::resolve_new_terminal_cwd(
             &crate::config::NewTerminalCwdConfig::Follow,

@@ -102,7 +102,7 @@ fn preserve_snapshot_history(path: &Path) -> io::Result<()> {
     let Ok(snapshot) = serde_json::from_slice::<SessionSnapshot>(&bytes) else {
         return Ok(());
     };
-    if snapshot.version > super::snapshot::SNAPSHOT_VERSION || snapshot.workspaces.is_empty() {
+    if snapshot.version > super::snapshot::MAX_SNAPSHOT_VERSION || snapshot.workspaces.is_empty() {
         return Ok(());
     }
     if let Some((_, latest)) = existing.last() {
@@ -198,7 +198,7 @@ fn copy_recovery(source: &mut impl io::Read, backup: &Path) -> io::Result<()> {
                 return Err(io::Error::new(
                     io::ErrorKind::AlreadyExists,
                     "recovery copy already exists",
-                ))
+                ));
             }
         }
         io::copy(source, &mut output)?;
@@ -313,6 +313,27 @@ mod tests {
 
     fn snapshots(writer: &SessionWriter) -> Vec<(u128, PathBuf)> {
         recovery_files(&writer.path.with_file_name("session-snapshots")).unwrap()
+    }
+
+    #[test]
+    fn isolated_session_version_gate_unloaded_backup_preserves_v4_without_fallback() {
+        let mut writer = writer(true);
+        let mut isolated = snapshot();
+        isolated.version = 4;
+        isolated.workspaces[0].isolated_execution = true;
+        let original = serde_json::to_vec(&isolated).unwrap();
+        std::fs::create_dir_all(writer.path.parent().unwrap()).unwrap();
+        std::fs::write(&writer.path, &original).unwrap();
+        // A reader that rejects v4 starts an empty/ordinary session, preserving
+        // the original; it must never use backup pane launches as a fallback.
+        writer.save(&snapshot(), None);
+        assert_eq!(backups(&writer), vec![original]);
+        let saved = std::fs::read_to_string(&writer.path).unwrap();
+        assert_eq!(
+            super::super::snapshot::snapshot_file_version(&saved),
+            Some(3)
+        );
+        std::fs::remove_dir_all(writer.path.parent().unwrap()).unwrap();
     }
 
     #[test]

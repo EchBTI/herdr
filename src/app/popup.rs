@@ -124,6 +124,12 @@ impl App {
             .workspaces
             .get(ws_idx)
             .ok_or_else(|| std::io::Error::other("active workspace disappeared"))?;
+        if ws.isolated_execution {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "owner popups are unavailable inside an isolated workspace; use an isolated pane command",
+            ));
+        }
         let active_tab = ws
             .active_tab()
             .ok_or_else(|| std::io::Error::other("active tab disappeared"))?;
@@ -196,6 +202,25 @@ impl App {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn isolated_execution_popup_is_rejected_before_any_spawn_or_state_mutation() {
+        let mut app = app_with_popup();
+        app.state.popup_pane = None;
+        app.state.workspaces[0].isolated_execution = true;
+        let count = app.state.terminals.len();
+        let result = app.spawn_popup_command(
+            None,
+            Vec::new(),
+            PopupGeometry::default(),
+            |_, _, _, _, _, _| panic!("isolated workspace must never enter owner popup spawn"),
+        );
+        let error = result.unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+        assert!(error.to_string().contains("isolated workspace"));
+        assert!(app.state.popup_pane.is_none());
+        assert_eq!(app.state.terminals.len(), count);
+    }
 
     fn app_with_popup() -> App {
         let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();

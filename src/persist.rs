@@ -20,3 +20,9 @@ pub use self::snapshot::{
     SessionSnapshot, TabSnapshot, WorkspaceSnapshot,
 };
 pub(crate) use self::writer::SessionWriter;
+
+/// Owner offline administration only. Preserve the session writer's atomic file
+/// replacement and parent-directory synchronization guarantees.
+pub(crate) fn save_offline_snapshot(snapshot: &SessionSnapshot) -> std::io::Result<()> {
+    self::io::save_to_path(&self::io::session_path(), snapshot)
+}

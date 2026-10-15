@@ -14,6 +14,13 @@ use super::{
     LimitedRead, Signal,
 };
 
+pub(super) mod identity;
+pub(crate) use identity::{
+    current_process_identity, effective_uid, host_identity, local_stream_peer_identity,
+    os_account_by_name, os_account_by_uid, os_account_in_group, os_accounts, os_group_by_name,
+    process_identity,
+};
+
 pub(crate) use super::unix_common::{
     configure_status_command, create_remote_private_dir, create_remote_ssh_config_dir,
     create_remote_ssh_config_file, hostname, local_datetime, remote_bridge_endpoint_path,

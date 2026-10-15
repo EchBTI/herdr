@@ -35,8 +35,12 @@ pub(super) mod windows_vti;
 /// This runs on a dedicated thread because stdin reading is blocking.
 /// The main loop receives the raw bytes and forwards them as
 /// `ClientMessage::Input` to the server.
+// The ownership gate extends the existing reader lifecycle without regrouping
+// unrelated host protocol and graphics state.
+#[allow(clippy::too_many_arguments)]
 pub fn stdin_reader_loop(
     event_tx: mpsc::Sender<ClientLoopEvent>,
+    #[cfg(unix)] stdin_ownership: Arc<std::sync::Mutex<()>>,
     should_quit: &Arc<AtomicBool>,
     host_color_query_sent: bool,
     host_theme_query_pending: Arc<AtomicU32>,
@@ -63,6 +67,7 @@ pub fn stdin_reader_loop(
     #[cfg(unix)]
     unix_stdin_reader_loop(
         event_tx,
+        stdin_ownership,
         should_quit,
         host_color_query_sent,
         host_theme_query_pending,
@@ -77,8 +82,11 @@ pub fn stdin_reader_loop(
 }
 
 #[cfg(unix)]
+// Keep the platform reader aligned with the public reader lifecycle above.
+#[allow(clippy::too_many_arguments)]
 fn unix_stdin_reader_loop(
     event_tx: mpsc::Sender<ClientLoopEvent>,
+    stdin_ownership: Arc<std::sync::Mutex<()>>,
     should_quit: &Arc<AtomicBool>,
     host_color_query_sent: bool,
     host_theme_query_pending: Arc<AtomicU32>,
@@ -91,7 +99,7 @@ fn unix_stdin_reader_loop(
     direct_response_active: Arc<AtomicBool>,
 ) {
     let stdin = io::stdin();
-    let mut reader = stdin.lock();
+    let mut reader = stdin;
     let mut scratch = [0u8; 4096];
     let mut framer = crate::raw_input::RawInputByteFramer::for_host_input();
     framer.set_host_escape_disambiguation_active(host_escape_disambiguation_active);
@@ -177,7 +185,18 @@ fn unix_stdin_reader_loop(
             }
             continue;
         }
-        match reader.read(&mut scratch) {
+        // An owner administration screen can temporarily borrow stdin. Poll while
+        // holding the ownership lock so a blocked read never prevents suspension.
+        let read = {
+            let Ok(_ownership) = stdin_ownership.lock() else {
+                return;
+            };
+            if stdin_read_ready(&reader, 25) == Some(false) {
+                continue;
+            }
+            reader.read(&mut scratch)
+        };
+        match read {
             Ok(0) => break,
             Ok(n) => {
                 // A redraw can issue queries while this thread is blocked in read().

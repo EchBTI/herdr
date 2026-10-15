@@ -921,6 +921,7 @@ fn coalesced_release_notes_open_and_scroll_uses_current_geometry() {
     state.set_pane_surface(surface());
     state.compose(106, 30).expect("initial shell");
     state.overlay = Some(ClientShellOverlay::GlobalMenu(ClientGlobalMenuOverlay {
+        space_access: false,
         highlighted: 3,
     }));
 
@@ -992,6 +993,7 @@ fn coalesced_release_notes_open_and_mouse_uses_current_geometry() {
     ));
 
     state.overlay = Some(ClientShellOverlay::GlobalMenu(ClientGlobalMenuOverlay {
+        space_access: false,
         highlighted: 3,
     }));
     state.handle_raw_events(vec![
@@ -1014,6 +1016,7 @@ fn coalesced_release_notes_open_and_mouse_uses_current_geometry() {
     ));
 
     state.overlay = Some(ClientShellOverlay::GlobalMenu(ClientGlobalMenuOverlay {
+        space_access: false,
         highlighted: 3,
     }));
     let closed = state.handle_raw_events(vec![
@@ -1157,6 +1160,7 @@ fn client_settings_preview_restore_and_endpoint_integrations_are_owned_by_overla
     state.set_snapshot(Box::new(snapshot()));
     state.set_pane_surface(surface());
     state.overlay = Some(ClientShellOverlay::GlobalMenu(ClientGlobalMenuOverlay {
+        space_access: false,
         highlighted: 0,
     }));
     let open = state.handle_input_bytes(b"\r");

@@ -109,6 +109,30 @@ pub(crate) fn generate_workspace_id() -> String {
     format!("w{}", encode_public_number(counter as usize))
 }
 
+/// Empty identity on entropy failure disables participant grants without making
+/// ordinary owner-only workspace creation depend on the sharing feature.
+pub(crate) fn generate_workspace_incarnation() -> String {
+    let mut bytes = [0u8; 16];
+    if let Err(error) = getrandom::fill(&mut bytes) {
+        tracing::error!(%error, "workspace authorization identity unavailable; sharing denied");
+        return String::new();
+    }
+    format!("wi_{:032x}", u128::from_be_bytes(bytes))
+}
+
+pub(crate) fn valid_workspace_incarnation(value: &str) -> bool {
+    value.len() == 35
+        && value.starts_with("wi_")
+        && value[3..].bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+pub(crate) fn restore_workspace_incarnation(value: Option<&str>) -> String {
+    value
+        .filter(|value| valid_workspace_incarnation(value))
+        .map(str::to_owned)
+        .unwrap_or_else(generate_workspace_incarnation)
+}
+
 pub(crate) fn encode_public_number(mut value: usize) -> String {
     if value == 0 {
         return "0".to_string();
@@ -176,6 +200,10 @@ pub(crate) fn reserve_workspace_ids(workspaces: &[Workspace]) {
 pub struct Workspace {
     /// Stable public workspace identity, independent of display order.
     pub id: String,
+    /// Authorization identity survives restoration and is never reused by a new workspace.
+    pub incarnation: String,
+    /// Once required, a missing or invalid execution profile must never run as owner.
+    pub isolated_execution: bool,
     /// User-provided override. If set, auto-derived identity stops updating.
     pub custom_name: Option<String>,
     /// Fallback workspace identity source for tests, old snapshots, or missing runtimes.
@@ -251,6 +279,8 @@ impl Workspace {
             discover_workspace_git_identity(&identity_cwd);
         Self {
             id,
+            incarnation: generate_workspace_incarnation(),
+            isolated_execution: false,
             custom_name: label,
             identity_cwd: identity_cwd.clone(),
             cached_identity_cwd: identity_cwd.clone(),
@@ -360,11 +390,15 @@ impl Workspace {
         extra_env: Vec<(String, String)>,
     ) -> std::io::Result<(Self, TerminalState, TerminalRuntime)> {
         let id = generate_workspace_id();
-        let launch_env = PaneLaunchEnv::from_extra(extra_env).with_identity(
-            id.clone(),
-            public_tab_id_for_number(&id, 1),
-            public_pane_id_for_number(&id, 1),
-        );
+        let incarnation = generate_workspace_incarnation();
+        let launch_env = PaneLaunchEnv::from_extra(extra_env)
+            .with_identity(
+                id.clone(),
+                public_tab_id_for_number(&id, 1),
+                public_pane_id_for_number(&id, 1),
+            )
+            .with_workspace_incarnation(incarnation.clone())
+            .with_isolation_required(false);
         let (tab, terminal, runtime) = if let Some(argv) = argv {
             Tab::new_argv_command(
                 1,
@@ -403,6 +437,8 @@ impl Workspace {
         Ok((
             Self {
                 id,
+                incarnation,
+                isolated_execution: false,
                 custom_name: None,
                 identity_cwd: initial_cwd.clone(),
                 cached_identity_cwd: initial_cwd.clone(),
@@ -982,11 +1018,14 @@ impl Workspace {
         pane_number: usize,
         extra_env: Vec<(String, String)>,
     ) -> PaneLaunchEnv {
-        PaneLaunchEnv::from_extra(extra_env).with_identity(
-            self.id.clone(),
-            public_tab_id_for_number(&self.id, tab_number),
-            public_pane_id_for_number(&self.id, pane_number),
-        )
+        PaneLaunchEnv::from_extra(extra_env)
+            .with_identity(
+                self.id.clone(),
+                public_tab_id_for_number(&self.id, tab_number),
+                public_pane_id_for_number(&self.id, pane_number),
+            )
+            .with_workspace_incarnation(self.incarnation.clone())
+            .with_isolation_required(self.isolated_execution)
     }
 
     pub fn public_tab_number(&self, tab_idx: usize) -> Option<usize> {
@@ -1069,18 +1108,30 @@ impl Workspace {
     }
 
     pub fn branch(&self) -> Option<String> {
+        if self.isolated_execution {
+            return None;
+        }
         self.cached_git_branch.clone()
     }
 
     pub fn git_ahead_behind(&self) -> Option<(usize, usize)> {
+        if self.isolated_execution {
+            return None;
+        }
         self.cached_git_ahead_behind
     }
 
     pub fn git_space(&self) -> Option<&GitSpaceMetadata> {
+        if self.isolated_execution {
+            return None;
+        }
         self.cached_git_space.as_ref()
     }
 
     pub fn worktree_space(&self) -> Option<&WorktreeSpaceMembership> {
+        if self.isolated_execution {
+            return None;
+        }
         self.worktree_space.as_ref()
     }
 
@@ -1192,6 +1243,8 @@ impl Workspace {
         public_pane_numbers.insert(tab.root_pane, 1);
         Self {
             id: generate_workspace_id(),
+            incarnation: generate_workspace_incarnation(),
+            isolated_execution: false,
             custom_name: Some(name.to_string()),
             identity_cwd: identity_cwd.clone(),
             cached_identity_cwd: identity_cwd.clone(),

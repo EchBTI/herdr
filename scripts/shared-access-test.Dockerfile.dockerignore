@@ -1,0 +1,12 @@
+# Dockerfile-specific context filter; preserve source and test contracts.
+/target
+/.git
+/.beads
+/.local
+/.codex
+/.agents
+**/__pycache__
+**/node_modules
+**/.env
+**/.env.*
+*.log

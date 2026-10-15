@@ -12,6 +12,9 @@ pub(super) fn dispatch_client_shell_actions(
     let mut repaint = false;
     for action in actions {
         match action {
+            shell::ClientShellAction::OwnerSpaceAccess => {
+                *scheduled_activation = Some(ClientLoopEvent::OwnerSpaceAccess);
+            }
             shell::ClientShellAction::Endpoint {
                 endpoint_id,
                 boot_id,
@@ -738,7 +741,7 @@ pub(super) fn install_client_shell_snapshot(
 
 pub(super) fn finish_client_shell_input(
     state: &mut ClientState,
-    outcome: shell::ClientShellInput,
+    mut outcome: shell::ClientShellInput,
     frame: Option<super::frame_output::ComposedFrame>,
     endpoints: &mut endpoint::EndpointRegistry,
     pending_activation: &mut Option<endpoint::PendingEndpointActivation>,
@@ -746,6 +749,9 @@ pub(super) fn finish_client_shell_input(
     prefix_input_source: &mut impl crate::platform::PrefixInputSource,
     scheduled_activation: &mut Option<ClientLoopEvent>,
 ) -> Result<bool, ClientError> {
+    if let Some(shell) = state.shell.as_mut() {
+        shell.filter_shared_input(&mut outcome);
+    }
     apply_client_shell_input_source_changes(state, prefix_input_source);
     if outcome.detach {
         let _ = write_to_server(endpoints, &ClientMessage::Detach);

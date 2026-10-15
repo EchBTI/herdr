@@ -7,11 +7,14 @@ fn queue_requests(server: &mut HeadlessServer, count: usize) -> std::sync::mpsc:
     for index in 0..count {
         sender
             .send(api::ApiRequestMessage {
+                native_shared: None,
+                native_client_id: None,
                 request: api::schema::Request {
                     id: index.to_string(),
                     method: api::schema::Method::WorkspaceList(api::schema::EmptyParams::default()),
                 },
                 respond_to: respond_to.clone(),
+                shared_scope: None,
                 response_write_complete: None,
             })
             .unwrap();
@@ -113,11 +116,14 @@ async fn server_loop_drains_api_backlog_and_runs_scheduled_work() {
         };
         sender
             .send(api::ApiRequestMessage {
+                native_shared: None,
+                native_client_id: None,
                 request: api::schema::Request {
                     id: index.to_string(),
                     method,
                 },
                 respond_to: respond_to.clone(),
+                shared_scope: None,
                 response_write_complete: None,
             })
             .unwrap();
@@ -176,8 +182,11 @@ fn external_api_burst_profile() {
             }
             first_samples.sort_unstable();
             total_samples.sort_unstable();
-            println!("api-burst panes={pane_count} requests={count} first_count={first_count} first_us={:.3} total_us={:.3}",
-                first_samples[3].as_secs_f64() * 1e6, total_samples[3].as_secs_f64() * 1e6);
+            println!(
+                "api-burst panes={pane_count} requests={count} first_count={first_count} first_us={:.3} total_us={:.3}",
+                first_samples[3].as_secs_f64() * 1e6,
+                total_samples[3].as_secs_f64() * 1e6
+            );
         }
     }
 }

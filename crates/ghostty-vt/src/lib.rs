@@ -1072,9 +1072,17 @@ impl Terminal {
     }
 
     pub fn enable_kitty_graphics(&mut self) -> Result<(), Error> {
+        self.configure_kitty_graphics(true)
+    }
+
+    /// Untrusted worker output may supply bytes, never host filesystem references.
+    pub fn enable_kitty_graphics_inline_only(&mut self) -> Result<(), Error> {
+        self.configure_kitty_graphics(false)
+    }
+
+    fn configure_kitty_graphics(&mut self, enable_medium: bool) -> Result<(), Error> {
         install_png_decoder_once();
         let storage_limit = KITTY_IMAGE_STORAGE_LIMIT_BYTES;
-        let enable_medium = true;
         let temp_dir = std::env::temp_dir();
         let temp_dir = temp_dir.to_string_lossy();
         let temp_dir = ffi::GhosttyString {
@@ -1097,7 +1105,11 @@ impl Terminal {
             ffi::ghostty_terminal_set(
                 self.raw,
                 ffi::GhosttyTerminalOption_GHOSTTY_TERMINAL_OPT_KITTY_IMAGE_MEDIUM_TEMP_FILE,
-                (&temp_dir as *const ffi::GhosttyString).cast(),
+                if enable_medium {
+                    (&temp_dir as *const ffi::GhosttyString).cast()
+                } else {
+                    std::ptr::null()
+                },
             )
             .into_result()?;
             ffi::ghostty_terminal_set(
@@ -1119,7 +1131,7 @@ impl Terminal {
             )
             .into_result()?;
         }
-        self.set_kitty_source_forwarding(true)?;
+        self.set_kitty_source_forwarding(enable_medium)?;
         Ok(())
     }
 
@@ -4150,6 +4162,24 @@ mod tests {
             terminal.resize(12, 6, 8, 16).unwrap();
             terminal.write(b"\x1b_Ga=T,f=32,t=d,i=7,p=3,s=1,v=1,c=1,r=1;/wAA/w==\x1b\\");
             assert!(terminal.kitty_image_placements().unwrap().is_empty());
+        }
+    }
+
+    #[test]
+    fn worker_graphics_accept_inline_bytes_without_host_media() {
+        let mut terminal = Terminal::new(10, 5, 0).unwrap();
+        terminal.enable_kitty_graphics_inline_only().unwrap();
+        assert!(!terminal
+            .get_bool(ffi::GhosttyTerminalData_GHOSTTY_TERMINAL_DATA_KITTY_IMAGE_MEDIUM_FILE)
+            .unwrap());
+        assert!(!terminal
+            .get_bool(ffi::GhosttyTerminalData_GHOSTTY_TERMINAL_DATA_KITTY_IMAGE_MEDIUM_SHARED_MEM)
+            .unwrap());
+        for sequence in [b"".as_slice(), b"\x1b[?1049h", b"\x1b[?1049l"] {
+            terminal.write(sequence);
+            terminal.resize(12, 6, 8, 16).unwrap();
+            terminal.write(b"\x1b_Ga=T,f=32,t=d,i=7,p=3,s=1,v=1,c=1,r=1;/wAA/w==\x1b\\");
+            assert!(!terminal.kitty_image_placements().unwrap().is_empty());
         }
     }
 

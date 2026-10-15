@@ -1,6 +1,6 @@
 # OS-user access to shared Herdr spaces
 
-Status: implementation specification, no runtime changes delivered
+Status: native shared access, durable grant identity and opt-in Linux isolated workers implemented; final worker qualification tracked in Beads
 
 Date: 15 October 2026
 
@@ -14,7 +14,7 @@ Audience: fork owner and implementers
 
 One OS user runs a persistent Herdr session. Other people log into the same host through their own OS accounts and attach to that session. The session owner opens an administration screen, selects OS users, and grants view or control rights to individual spaces. Each participant receives only authorised space data.
 
-“Space” is the user-facing term; the current runtime entity is `workspace`. Permissions attach to stable workspace IDs, never labels, array positions, or working-directory paths.
+“Space” is the user-facing term; the current runtime entity is `workspace`. Permissions attach to public workspace IDs plus persisted incarnations, never labels, array positions, or working-directory paths.
 
 Example: `emech` owns the server. Alice can control Client A and view Shared Tools. Bob can control Client B. Neither receives the other client's space metadata or terminal output through Herdr. The owner sees and administers every space.
 
@@ -26,7 +26,7 @@ OS accounts establish the identity of connecting clients. They do not change the
 
 This limitation must appear in the grant dialogue, setup documentation, and release qualification. Default new grants to View. Granting Control requires an explicit acknowledgement explaining the actual execution user. No claim of hostile-user isolation or confidential project isolation is permitted for this release. The UI must not imply that hidden spaces protect files from a user with Control.
 
-A later isolated-execution phase must use restricted workers, separate OS identities or containers, constrained filesystem/credential mounts, and a scoped broker that cannot reach owner control endpoints. It is tracked as a separate blocked phase. The initial release is useful only where controllers are trusted with the server owner's privileges.
+The opt-in isolated-execution phase uses rootless Linux Bubblewrap namespaces, a single writable project mount and a scoped integration broker. It retains the owner's outer host UID; it does not provision another host account. Ordinary spaces remain trusted collaboration. Isolated spaces have no network and inherit no owner/provider credentials, so online AI/provider use requires a separate future extension. See `isolated-workers-architecture.md` for the recorded design and qualification boundary.
 
 ## Users and permissions
 
@@ -37,7 +37,7 @@ A later isolated-execution phase must use restricted workers, separate OS identi
 | Control | Granted spaces | Yes | Within granted spaces | No | No |
 | No grant | None | No | No | No | No |
 
-Only the server's effective UID is Owner. Owner authority cannot be granted, transferred, or revoked through the client. Root and host administrators are outside the application isolation boundary. Space creation, deletion, grants, global configuration, plugin/integration installation, update/restart/stop, layout imports spanning spaces, machine registration, and handoff are owner-only. Control may close individual panes/tabs within its space. Multi-space moves remain owner-only in v1 to avoid implicit permission propagation.
+Only the server's effective UID is Owner. Owner authority cannot be granted, transferred, or revoked through the client. Root and host administrators are outside the application isolation boundary. Space creation, deletion, grants, global configuration, plugin/integration installation, update/restart/stop, layout imports spanning spaces and machine registration are owner-only. Private handoff fails closed while sharing or isolated workers are active. Control may close individual panes/tabs within its space. Multi-space moves remain owner-only in v1 to avoid implicit permission propagation.
 
 New spaces have no non-owner grants. Renaming preserves grants. Deleting a space deletes its grants. Recreating a space with the same name never restores grants. New panes and tabs inherit their containing space's permission. Popups and terminals without a reliably resolved space are owner-only. No workspace-scoped administrator role is included.
 
@@ -105,7 +105,7 @@ Audit sharing changes, grants, revocations, failed access and attach/detach usin
 6. Restart, corrupt/truncate the policy, delete/rename/recreate spaces, invalidate accounts, reuse UID with a changed name and disable sharing. Assert no grant resurrection or non-owner fallback creation.
 7. Test group membership, owner and socket modes, stale paths and symlink replacement without making private home/state paths accessible. Run multi-UID tests in an explicitly provisioned disposable Linux environment, never create accounts on a developer's workstation automatically.
 8. Existing private sessions and compatible owner clients retain their behaviour. Frozen protocol fixtures remain unchanged unless a new negotiated codec is introduced. Run the repository's applicable `just` gates and render-scaling qualification before release.
-9. The initial release is labelled trusted collaboration. Strong-isolation claims and rollout to mutually untrusted controllers remain blocked until isolated-worker escape tests pass.
+9. Ordinary spaces are labelled trusted collaboration. Isolated workers are explicitly configured offline, retain accurate host-account/namespace labels, fail closed on unavailable profiles or namespaces, and require actual-runtime escape/lifecycle qualification before stronger rollout claims.
 
 ## Implementation sequence and source boundaries
 
@@ -125,7 +125,7 @@ Verified source anchors at the baseline (locations, not claims of completed supp
 
 Native macOS shared hosting and Windows account/named-pipe support are deferred; existing single-user operation must continue to compile and work. Cross-host grant federation, per-space delegated admins, SSO, billing and arbitrary web access are excluded.
 
-The first engineering decision bead must confirm the trusted-controller scope and record the selected shared endpoint layout, account refresh bound and remote-client support contract. Isolated workers have a separate design gate before implementation. Neither phase requires the main Herdr daemon to run as root.
+The architecture decisions record the trusted-controller scope, shared endpoint layout, account refresh and remote-client contract, plus the rootless Bubblewrap worker boundary. Neither phase requires a root-running Herdr daemon; isolated mode rejects root hosting and setuid Bubblewrap.
 
 ## References
 
@@ -138,10 +138,33 @@ The first engineering decision bead must confirm the trusted-controller scope an
 
 ## Beads implementation map
 
-The issue tracker is authoritative for status and dependency ordering. This map only identifies the planned work.
+The issue tracker is authoritative for status and dependency ordering. This map identifies the implementation work; consult `bd` for current status.
 
 - Phase one epic: `herdr-17y`, with `herdr-17y.1` through `herdr-17y.12` covering architecture, identity, policy, endpoint, enforcement, projection, revocation, administration API, administration UI, audit, qualification and documentation respectively.
 - Phase two epic: `herdr-ocr`, with decision `herdr-ocr.1`, worker implementation `herdr-ocr.2`, and isolation qualification `herdr-ocr.3`.
 - Start with `bd ready`, then `bd show herdr-17y.1`. Claim one ready issue with `bd update <id> --claim` before implementation.
 
-See `.beads/PLANNING.md` for tracker recovery and sync instructions. No implementation task has been marked complete by preparation of this specification.
+See `.beads/PLANNING.md` for tracker recovery and sync instructions. Issue closure requires the corresponding acceptance evidence; this document is not a status substitute.
+
+## Implementation conformance (15 October 2026)
+
+The fork now provides the normal native Herdr renderer and event loop through a negotiated Linux shared endpoint. The JSON broker remains the owner administration and scripting surface; the earlier polling screen is an explicit `--text` option. Existing private sockets and frozen protocol codecs retain their original contracts.
+
+Kernel-authenticated principals follow connections into server state. Bootstrap snapshots, agent/completion data, retained surfaces, graphics and notifications are scoped per recipient. View navigation and passive reads preserve owner focus and terminal geometry. Control supports terminal typing/mouse input and scoped native tab/pane operations. Owner configuration, custom server commands, worktrees, global APIs, plugins, cross-space moves, owner popups and legacy direct attach remain private.
+
+The native owner menu opens Space access in the same process with terminal restoration. Its user matrix shows live connection counts. Policy saves disconnect existing shared clients and cancel queued output/input before acknowledgement; clients clear their display and must reattach. This includes grant additions, making policy revisions consistent. Revocation cannot recall bytes already delivered or recipients’ retained copies.
+
+Durable policy and isolated execution:
+
+- Schema-2 policy binds stable host/owner identity, participant UID/name and workspace incarnation. Valid grants survive server restart; an old broker still refuses a replacement runtime until disabled/re-enabled. Old preview policy requires a one-time regrant. Deleted/replaced workspaces and invalid accounts lose stale grants.
+- Native and broker attach/detach, denials and policy events feed a bounded asynchronous owner-only audit. Policy events have reserved queue capacity. Keystrokes and terminal content are excluded; this diagnostic log is not immutable compliance evidence.
+- Owner offline configuration selects `session worker enable --space <id> --project <root> --ack-restart`, after stopping the server. Restart recreates all PTYs through the scoped launcher. `worker disable --space <id> --ack-restart` also requires an offline restart; `worker status` inspects the live server. Missing profiles never fall back to trusted execution.
+- Sessions containing isolated workspaces use snapshot format 4; ordinary sessions retain format 3. The execution requirement survives restore, and unsupported newer snapshots are preserved without trusted-session fallback. Use compatible fork binaries for isolated sessions.
+- Worker mount policy exposes one writable project, read-only system programs, private HOME/tmp/proc/dev, the executable and a scoped broker. Environment secrets, owner sockets and sibling roots are excluded. Tokens bind workspace/incarnation/runtime generation and rotate on restart. Project-scoped CLI reporting is supported.
+- Isolated execution labels show the owner host account and namespace mode, not another host UID. Network is disabled; online provider/agent credentials and network provisioning are outside the initial supported mode. Host Git helpers, popups, custom host shell commands and plugins are blocked in isolated spaces; managed terminal creation stays wrapped. Cross-boundary terminal moves are denied.
+- Kernel/administrator/system-binary trust, credentials deliberately placed in the project and resource exhaustion remain residual risks. Actual-runtime worker escape, restart, revocation and crash qualification must be recorded before claiming the phase-two release gates passed.
+- Shared hosting is Linux-only. Participants SSH in as themselves and attach locally; native SSH/Cloud shared bridging and legacy direct attach remain excluded. Graphics use inline bytes; owner file references and cross-account image paste are disabled. An actual older-binary compatibility run remains optional and was skipped without its fixture.
+
+Read `docs/next/shared-access.md` for use and recovery and `.local/prd/os-user-space-access-validation.md` for measured results. These are implemented boundaries; the validation record and Beads retain the acceptance evidence and any remaining qualification limits.
+
+Repeatable qualification commands are `just test-shared-access-linux` and `just test-isolated-workers-linux`. Both build disposable fixture images without host mounts; the worker recipe permits nested namespaces/procfs at the outer Docker boundary while leaving the owner and payload unprivileged. This recipe is not permission to provision host accounts or expose a Docker socket. Recorded results belong in the validation record, not inferred from the existence of the recipes.

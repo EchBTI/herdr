@@ -37,7 +37,9 @@ impl HeadlessServer {
         &self,
         client_id: u64,
     ) -> Option<(&crate::terminal::TerminalRuntime, crate::layout::PaneId)> {
-        if self.popup_owner_tab_id == self.shell_tab_id_for_client(client_id) {
+        if self.popup_owner_tab_id.is_some()
+            && self.popup_owner_tab_id == self.shell_tab_id_for_client(client_id)
+        {
             if let Some(popup) = &self.app.state.popup_pane {
                 return self
                     .app
@@ -316,7 +318,9 @@ impl HeadlessServer {
                 } else {
                     pane_ids.extend(tab.layout.pane_ids());
                 }
-                if self.popup_owner_tab_id == self.shell_tab_id_for_client(client_id) {
+                if self.popup_owner_tab_id.is_some()
+                    && self.popup_owner_tab_id == self.shell_tab_id_for_client(client_id)
+                {
                     if let Some(popup) = &self.app.state.popup_pane {
                         pane_ids.insert(popup.pane_id);
                     }
@@ -424,7 +428,8 @@ impl HeadlessServer {
                 .as_ref()
                 .is_some_and(|popup| popup.pane_id == pane_id)
             {
-                return self.popup_owner_tab_id == self.shell_tab_id_for_client(client_id);
+                return self.popup_owner_tab_id.is_some()
+                    && self.popup_owner_tab_id == self.shell_tab_id_for_client(client_id);
             }
             let Some(target) = self.shell_target_for_client(client_id) else {
                 return false;
@@ -493,7 +498,13 @@ impl HeadlessServer {
             let Some(tab_id) = self.shell_tab_id_for_client(*client_id) else {
                 continue;
             };
-            if self.tab_geometry_controllers.get(&tab_id) != Some(client_id) {
+            if self.tab_geometry_controllers.get(&tab_id) != Some(client_id)
+                || !self
+                    .shell_target_for_client(*client_id)
+                    .is_some_and(|target| {
+                        self.shared_can_control(*client_id, target.workspace_index)
+                    })
+            {
                 continue;
             }
             let changed = client
@@ -572,7 +583,8 @@ impl HeadlessServer {
             let area = Rect::new(0, 0, cols, rows);
             let shell_target = self.shell_target_for_client(client_id);
             let shell_tab_id = self.shell_tab_id_for_client(client_id);
-            let shell_shows_popup = shell_tab_id.as_deref() == self.popup_owner_tab_id.as_deref();
+            let shell_shows_popup = shell_target.is_some()
+                && shell_tab_id.as_deref() == self.popup_owner_tab_id.as_deref();
             let shell_graphics_delivery = self
                 .clients
                 .get(&client_id)
@@ -628,8 +640,11 @@ impl HeadlessServer {
                     .clients
                     .get(&client_id)
                     .and_then(|client| client.shell_location.clone());
-                let agent_view = self.app.state.agent_view_override.clone();
-                let Some(client) = self.clients.get_mut(&client_id) else {
+                let shared = self.shared_is_participant(client_id);
+                let agent_view = (!shared)
+                    .then(|| self.app.state.agent_view_override.clone())
+                    .flatten();
+                let Some(client) = self.clients.get(&client_id) else {
                     continue;
                 };
                 let (mut candidate, mut completions) = client_shell_snapshot(
@@ -639,10 +654,16 @@ impl HeadlessServer {
                     None,
                     location.as_ref(),
                 );
-                candidate.config_diagnostic = if client.shell_uses_endpoint_keybindings {
+                candidate.config_diagnostic = if shared {
+                    None
+                } else if client.shell_uses_endpoint_keybindings {
                     self.server_config_diagnostic.clone()
                 } else {
                     self.server_config_diagnostic_without_keybindings.clone()
+                };
+                self.project_shared_shell_snapshot(client_id, &mut candidate, &mut completions);
+                let Some(client) = self.clients.get_mut(&client_id) else {
+                    continue;
                 };
                 candidate.revision = client.shell_projection_revision;
                 if client.shell_snapshot.as_ref() != Some(&candidate)

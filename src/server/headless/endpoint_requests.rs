@@ -15,6 +15,25 @@ impl HeadlessServer {
             return true;
         }
         let request_id = request.id.clone();
+        if self.shared_is_participant(client_id) {
+            self.bind_shared_method_target(client_id, &mut request.method);
+            if let api::schema::Method::PaneRead(params) = &mut request.method {
+                params.intent = api::schema::ReadIntent::Passive;
+            }
+        }
+
+        if !self.shared_method_allowed(client_id, &request.method) {
+            self.audit_shared_client(client_id, request.method.operation().name, "denied", None);
+            let response = crate::server::client_commands::error_message(
+                boot_id,
+                request_id,
+                "unavailable",
+                "object unavailable or access denied",
+            );
+            self.send_to_client(client_id, response);
+            return false;
+        }
+
         if !crate::server::client_commands::supports_client_shell_method(&request.method) {
             let message = crate::server::client_commands::error_message(
                 boot_id,
@@ -124,8 +143,11 @@ impl HeadlessServer {
             | self.handle_client_shell_api_request(
                 client_id,
                 api::ApiRequestMessage {
+                    native_shared: None,
+                    native_client_id: Some(client_id),
                     request: *request,
                     respond_to,
+                    shared_scope: None,
                     response_write_complete: None,
                 },
             )

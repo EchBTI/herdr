@@ -78,6 +78,39 @@ impl App {
         resolve_new_terminal_cwd(&self.state.new_terminal_cwd, follow_cwd)
     }
 
+    /// Implicit launches in an isolated space stay within its mounted project,
+    /// independently of the owner's ordinary terminal cwd preference. Explicit
+    /// request cwd values still reach the worker launcher for validation.
+    pub(super) fn resolve_new_terminal_cwd_in_workspace(
+        &self,
+        ws_idx: usize,
+        follow_cwd: Option<PathBuf>,
+    ) -> PathBuf {
+        let Some(workspace) = self.state.workspaces.get(ws_idx) else {
+            return self.resolve_new_terminal_cwd(follow_cwd);
+        };
+        if !workspace.isolated_execution {
+            return self.resolve_new_terminal_cwd(follow_cwd);
+        }
+        // This runs only on creation, never during rendering. The persisted
+        // definition also supplies the project root before a live pane exists.
+        let project_root = crate::shared::worker::definition(&workspace.id)
+            .ok()
+            .flatten()
+            .filter(|definition| definition.incarnation == workspace.incarnation)
+            .map(|definition| definition.project_root)
+            .unwrap_or_else(|| workspace.identity_cwd.clone());
+        follow_cwd
+            .filter(|cwd| {
+                cwd.is_absolute()
+                    && cwd.starts_with(&project_root)
+                    && !cwd
+                        .components()
+                        .any(|component| matches!(component, std::path::Component::ParentDir))
+            })
+            .unwrap_or(project_root)
+    }
+
     pub(crate) fn resolved_new_workspace_cwd_from(&self, ws_idx: usize) -> PathBuf {
         let tab_idx = self
             .state
@@ -97,7 +130,7 @@ impl App {
             .map(|tab| tab.layout.focused())
             .and_then(|pane_id| self.launch_cwd_for_pane_in_workspace(ws_idx, pane_id))
             .or_else(|| self.seed_cwd_from_workspace(ws_idx));
-        self.resolve_new_terminal_cwd(follow_cwd)
+        self.resolve_new_terminal_cwd_in_workspace(ws_idx, follow_cwd)
     }
 
     pub(super) fn workspace_creation_source(&self) -> Option<usize> {

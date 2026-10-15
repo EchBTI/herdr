@@ -56,8 +56,8 @@ use crate::server::client_shell::{
 };
 use crate::server::client_transport::ServerEvent;
 use crate::server::clients::{
-    latest_shell_client, render_targets, terminal_stream_client_ids, ClientConnection,
-    ClientConnectionMode, ClientShellInputTarget, DeferredRender,
+    render_targets, terminal_stream_client_ids, ClientConnection, ClientConnectionMode,
+    ClientShellInputTarget, DeferredRender,
 };
 use crate::server::keybindings::{app_keybindings, apply_keybindings};
 use crate::server::notifications::{
@@ -82,7 +82,10 @@ mod native_graphics;
 mod notifications;
 mod render;
 mod retained_surface;
+mod shared_access;
+mod shared_projection;
 mod surface_interest;
+mod worker_access;
 
 // Producers can refill even a bounded channel while it is being drained.
 // Yield to scheduled work and rendering between batches; select! below
@@ -190,6 +193,7 @@ enum AltScreenReadConflict {
 
 /// The headless server — runs the herdr event loop without a real terminal.
 pub struct HeadlessServer {
+    native_shared: Option<shared_access::NativeShared>,
     app: app::App,
     #[cfg(unix)]
     api_tx: Option<api::ApiRequestSender>,
@@ -349,6 +353,7 @@ impl HeadlessServer {
         #[cfg(not(unix))]
         let _ = api_tx;
         Ok(Self {
+            native_shared: None,
             app,
             #[cfg(unix)]
             api_tx,
@@ -493,6 +498,10 @@ impl HeadlessServer {
             self.app.sync_focus_events();
             self.app.sync_session_save_schedule();
 
+            if self.refresh_native_shared_access(false).unwrap_or(true) {
+                needs_render = true;
+                needs_full_render = true;
+            }
             // 4. Accept new client connections.
             self.accept_client_connections()?;
 
@@ -522,7 +531,11 @@ impl HeadlessServer {
                 needs_graphics_render = false;
             }
 
-            if latest_shell_client(&self.clients).is_some() && self.app.ensure_default_workspace() {
+            if self.clients.iter().any(|(&id, client)| {
+                !self.shared_is_participant(id)
+                    && matches!(client.mode, ClientConnectionMode::ClientShell)
+            }) && self.app.ensure_default_workspace()
+            {
                 needs_render = true;
                 needs_full_render = true;
                 needs_graphics_render = false;
@@ -796,6 +809,12 @@ impl HeadlessServer {
     }
 
     fn sync_foreground_client_state(&mut self) {
+        if self
+            .foreground_client_id
+            .is_some_and(|id| self.shared_is_participant(id))
+        {
+            self.foreground_client_id = self.latest_private_shell_client();
+        }
         self.app.pixel_mouse_available = self.foreground_client_id.is_some_and(|id| {
             self.clients
                 .get(&id)
@@ -893,7 +912,20 @@ impl HeadlessServer {
         )
     }
 
+    fn latest_private_shell_client(&self) -> Option<u64> {
+        self.clients
+            .iter()
+            .filter(|(id, client)| {
+                client.is_active_shell_client() && !self.shared_is_participant(**id)
+            })
+            .max_by_key(|(_, client)| client.last_activity)
+            .map(|(&id, _)| id)
+    }
+
     fn promote_client_to_foreground(&mut self, client_id: u64) -> bool {
+        if self.shared_is_participant(client_id) {
+            return false;
+        }
         let stamp = self.allocate_activity_stamp();
         let Some(client) = self.clients.get_mut(&client_id) else {
             return false;
@@ -910,7 +942,7 @@ impl HeadlessServer {
     }
 
     fn promote_latest_remaining_client(&mut self) -> bool {
-        let next_foreground = latest_shell_client(&self.clients);
+        let next_foreground = self.latest_private_shell_client();
         let changed = next_foreground != self.foreground_client_id;
         self.foreground_client_id = next_foreground;
         self.sync_foreground_client_state();
@@ -944,6 +976,7 @@ impl HeadlessServer {
     }
 
     fn remove_client(&mut self, client_id: u64) -> bool {
+        self.audit_shared_client(client_id, "detach", "allowed", None);
         self.disconnect_native_graphics(client_id);
         let disconnected_focus = self
             .clients
@@ -1046,6 +1079,7 @@ impl HeadlessServer {
         if self.handoff_in_progress {
             return reject_pending_client_connections(&self.client_listener);
         }
+        self.accept_shared_native_connections()?;
         accept_pending_client_connections(
             &self.client_listener,
             &mut self.next_client_id,
@@ -1201,6 +1235,9 @@ impl HeadlessServer {
                 else {
                     return false;
                 };
+                if !self.shared_pane_execution_allowed(workspace_index, runtime_pane_id) {
+                    return false;
+                }
                 let popup_blocks_input = self.app.state.popup_pane.is_some()
                     && self.popup_owner_tab_id == self.shell_tab_id_for_client(client_id);
                 if popup_blocks_input
@@ -1210,6 +1247,10 @@ impl HeadlessServer {
                 }
                 let foreground_changed = self.promote_client_to_foreground(client_id);
                 let geometry_changed = self.claim_shell_tab_geometry(client_id, false);
+                if !self.shared_can_control(client_id, workspace_index) {
+                    self.audit_shared_client(client_id, "terminal.input", "denied", None);
+                    return false;
+                }
                 let Some(runtime) = self.app.state.runtime_for_pane_in_workspace(
                     &self.app.terminal_runtimes,
                     workspace_index,
@@ -1598,6 +1639,14 @@ impl HeadlessServer {
 
         let mut broken_clients: Vec<u64> = Vec::new();
         for (&client_id, client) in &mut self.clients {
+            if client.auth.is_some()
+                && !matches!(
+                    &msg,
+                    ServerMessage::ReloadSoundConfig | ServerMessage::ServerShutdown { .. }
+                )
+            {
+                continue;
+            }
             if let Some(writer) = &client.writer {
                 if writer.control.send(serialized.clone()).is_err() {
                     debug!(client_id, "client writer channel closed during broadcast");
@@ -1625,7 +1674,9 @@ impl HeadlessServer {
             .clients
             .iter()
             .filter_map(|(&client_id, client)| {
-                matches!(client.mode, ClientConnectionMode::ClientShell).then_some(client_id)
+                (matches!(client.mode, ClientConnectionMode::ClientShell)
+                    && self.shared_message_allowed(client_id, &msg))
+                .then_some(client_id)
             })
             .collect::<Vec<_>>();
         let mut sent = false;
@@ -1656,6 +1707,9 @@ impl HeadlessServer {
     /// Sends a message to a specific client. Returns false if the client
     /// was not found or the send failed (client removed).
     fn send_to_client(&mut self, client_id: u64, msg: ServerMessage) -> bool {
+        if !self.shared_message_allowed(client_id, &msg) {
+            return false;
+        }
         let serialized = match Self::frame_server_message(&msg) {
             Ok(framed) => framed,
             Err(err) => {
@@ -1847,12 +1901,28 @@ impl HeadlessServer {
 
     /// Handles a server event. Returns true if the event requires a re-render.
     fn handle_server_event(&mut self, ev: ServerEvent) -> bool {
+        let direct_client = match &ev {
+            ServerEvent::ClientInput { client_id, .. }
+            | ServerEvent::ClientAttachTerminal { client_id, .. }
+            | ServerEvent::ClientObserveTerminal { client_id, .. }
+            | ServerEvent::ClientControlTerminal { client_id, .. }
+            | ServerEvent::ClientAttachScroll { client_id, .. }
+            | ServerEvent::ClientAttachMouse { client_id, .. } => Some(*client_id),
+            _ => None,
+        };
+        if direct_client.is_some_and(|id| self.shared_is_participant(id)) {
+            if let Some(id) = direct_client {
+                self.audit_shared_client(id, "terminal.direct", "denied", None);
+            }
+            return false;
+        }
         if self.handoff_in_progress && Self::ignore_client_event_during_handoff(&ev) {
             return false;
         }
 
         match ev {
             ServerEvent::ClientConnected {
+                auth,
                 client_id,
                 cols,
                 rows,
@@ -1861,6 +1931,13 @@ impl HeadlessServer {
                 pixel_mouse,
                 writer,
             } => {
+                if auth
+                    .as_ref()
+                    .is_some_and(|auth| !self.shared_auth_is_current(auth))
+                {
+                    writer.revoke();
+                    return false;
+                }
                 if self.handoff_in_progress {
                     if let Ok(message) =
                         Self::frame_server_message(&ServerMessage::ServerShutdown {
@@ -1892,11 +1969,13 @@ impl HeadlessServer {
                     protocol::RenderEncoding::TerminalAnsi,
                     Some(writer),
                 );
+                connection.auth = auth;
                 connection.pixel_mouse = pixel_mouse;
                 self.clients.insert(client_id, connection);
                 false
             }
             ServerEvent::ClientShellConnected {
+                auth,
                 client_id,
                 surface_cols,
                 surface_rows,
@@ -1912,6 +1991,13 @@ impl HeadlessServer {
                 surface_scroll,
                 writer,
             } => {
+                if auth
+                    .as_ref()
+                    .is_some_and(|auth| !self.shared_auth_is_current(auth))
+                {
+                    writer.revoke();
+                    return false;
+                }
                 if self.handoff_in_progress {
                     if let Ok(message) =
                         Self::frame_server_message(&ServerMessage::ServerShutdown {
@@ -1935,7 +2021,9 @@ impl HeadlessServer {
                     render_encoding = ?protocol::RenderEncoding::SemanticFrame,
                     "client connected"
                 );
-                self.app.ensure_default_workspace();
+                if auth.is_none() {
+                    self.app.ensure_default_workspace();
+                }
                 let first_app_client = self.app_client_count() == 0;
                 let last_activity = self.allocate_activity_stamp();
                 let observed = crate::kitty_graphics::HostCellSize {
@@ -1950,6 +2038,7 @@ impl HeadlessServer {
                     protocol::RenderEncoding::SemanticFrame,
                     Some(writer),
                 );
+                connection.auth = auth;
                 connection.pixel_mouse = pixel_mouse && observed.is_known();
                 connection.direct_graphics = direct_graphics;
                 connection.shell_uses_endpoint_keybindings = endpoint_keybindings;
@@ -1961,21 +2050,34 @@ impl HeadlessServer {
                     .render_state
                     .enable_surface_scroll(surface_scroll);
                 connection.shell_projection_revision = 1;
-                let config_diagnostic = if endpoint_keybindings {
+                self.clients.insert(client_id, connection);
+                self.audit_shared_client(client_id, "attach", "allowed", None);
+                let config_diagnostic = if self.shared_is_participant(client_id) {
+                    None
+                } else if endpoint_keybindings {
                     self.server_config_diagnostic.as_deref()
                 } else {
                     self.server_config_diagnostic_without_keybindings.as_deref()
                 };
-                let (seed_snapshot, completion_projection) = client_shell_snapshot(
+                let (mut seed_snapshot, mut completion_projection) = client_shell_snapshot(
                     &self.app,
                     &self.client_shell_boot_id,
-                    connection.shell_projection_revision,
+                    1,
                     config_diagnostic,
                     None,
                 );
+                self.project_shared_shell_snapshot(
+                    client_id,
+                    &mut seed_snapshot,
+                    &mut completion_projection,
+                );
                 let location =
                     crate::server::clients::ClientShellLocation::from_snapshot(&seed_snapshot);
-                let agent_view = self.app.state.agent_view_override.clone();
+                let agent_view = if self.shared_is_participant(client_id) {
+                    None
+                } else {
+                    self.app.state.agent_view_override.clone()
+                };
                 let projection_message = match agent_view.as_ref() {
                     Some(view) => match crate::protocol::endpoint::agent_view_projection_message(
                         &seed_snapshot.boot_id,
@@ -2007,20 +2109,30 @@ impl HeadlessServer {
                         return false;
                     }
                 };
-                connection.shell_location = Some(location);
-                connection.shell_snapshot = Some(seed_snapshot);
-                connection.shell_agent_completions = Some(completion_projection);
-                connection.shell_agent_view = agent_view;
-                self.clients.insert(client_id, connection);
+                if let Some(connection) = self.clients.get_mut(&client_id) {
+                    connection.shell_location = Some(location);
+                    connection.shell_snapshot = Some(seed_snapshot);
+                    connection.shell_agent_completions = Some(completion_projection);
+                    connection.shell_agent_view = agent_view;
+                }
+                if let Some(message) = self.shared_access_message(client_id) {
+                    self.send_to_client(client_id, message);
+                }
+                if let Some(message) = self.worker_execution_message(client_id) {
+                    self.send_to_client(client_id, message);
+                }
                 if self.app.state.popup_pane.is_some() && self.popup_owner_tab_id.is_none() {
-                    self.popup_owner_tab_id = self.shell_tab_id_for_client(client_id);
+                    self.popup_owner_tab_id = self.default_shell_target().and_then(|target| {
+                        self.app
+                            .public_tab_id(target.workspace_index, target.tab_index)
+                    });
                 }
                 if let Some(message) = projection_message {
                     self.send_to_client(client_id, message);
                 }
                 self.send_to_client(client_id, completion_message);
                 self.send_to_client(client_id, snapshot_message);
-                if surface_active {
+                if surface_active && !self.shared_is_participant(client_id) {
                     self.foreground_client_id = Some(client_id);
                 }
                 if first_app_client {
@@ -2133,6 +2245,19 @@ impl HeadlessServer {
                 extension,
                 data,
             } => {
+                if self.shared_is_participant(client_id) {
+                    let allowed = match &target {
+                        protocol::ClientClipboardImageTarget::Pane(pane_id) => self
+                            .app
+                            .parse_pane_id(pane_id)
+                            .is_some_and(|(index, _)| self.shared_can_control(client_id, index)),
+                        _ => false,
+                    };
+                    if !allowed {
+                        self.audit_shared_client(client_id, "clipboard.upload", "denied", None);
+                        return false;
+                    }
+                }
                 debug!(
                     client_id,
                     len = data.len(),
@@ -2258,6 +2383,9 @@ impl HeadlessServer {
                 true
             }
             ServerEvent::ClientShellHostTheme { client_id, update } => {
+                if self.shared_is_participant(client_id) {
+                    return false;
+                }
                 let Some(client) = self.clients.get_mut(&client_id) else {
                     return false;
                 };
@@ -2281,6 +2409,15 @@ impl HeadlessServer {
                 changed
             }
             ServerEvent::ClientShellFocus { client_id, focused } => {
+                if self.shared_is_participant(client_id)
+                    && self
+                        .shell_target_for_client(client_id)
+                        .is_none_or(|target| {
+                            !self.shared_can_control(client_id, target.workspace_index)
+                        })
+                {
+                    return false;
+                }
                 let Some(client) = self.clients.get(&client_id) else {
                     return false;
                 };
@@ -2378,6 +2515,13 @@ impl HeadlessServer {
                 else {
                     return false;
                 };
+                if !self.shared_can_control(client_id, workspace_index) {
+                    self.audit_shared_client(client_id, "terminal.input", "denied", None);
+                    return false;
+                }
+                if !self.shared_pane_execution_allowed(workspace_index, runtime_pane_id) {
+                    return false;
+                }
                 let Some(runtime) = self.app.state.runtime_for_pane_in_workspace(
                     &self.app.terminal_runtimes,
                     workspace_index,
@@ -2460,6 +2604,9 @@ impl HeadlessServer {
                 terminal_id,
                 events,
             } => {
+                if self.shared_is_participant(client_id) {
+                    return false;
+                }
                 if self.handoff_in_progress
                     || !self
                         .clients
@@ -2551,6 +2698,12 @@ impl HeadlessServer {
                 code,
                 message,
             } => {
+                self.audit_shared_client(
+                    client_id,
+                    "endpoint.invalid_or_unsupported",
+                    "denied",
+                    None,
+                );
                 let Some(client) = self.clients.get(&client_id) else {
                     return false;
                 };
@@ -2918,6 +3071,30 @@ impl HeadlessServer {
             return false;
         }
 
+        if msg
+            .shared_scope
+            .as_ref()
+            .is_some_and(|scope| !scope.unexpired() || !scope.validates(&self.app, &msg.request))
+        {
+            let _ = msg
+                .respond_to
+                .send(crate::shared::scope::SharedScope::denied_response(
+                    &msg.request,
+                ));
+            return false;
+        }
+
+        if let Some(command) = msg.native_shared.clone() {
+            let result = self.handle_native_shared_command(command);
+            let response = match result {
+                Ok(value) => serde_json::json!({"id":msg.request.id,"result":value}),
+                Err(_) => {
+                    serde_json::json!({"id":msg.request.id,"error":{"code":"unavailable","message":"native sharing unavailable"}})
+                }
+            };
+            let _ = msg.respond_to.send(response.to_string());
+            return true;
+        }
         let frozen_alt_screen_read = match self.alt_screen_read_conflict(&msg.request) {
             AltScreenReadConflict::None => None,
             AltScreenReadConflict::Frozen(snapshot) => Some(snapshot),
@@ -2929,6 +3106,18 @@ impl HeadlessServer {
 
         let metadata_expired = self.app.expire_due_metadata(Instant::now());
         if let api::schema::Method::ServerLiveHandoff(params) = &msg.request.method {
+            if self.native_shared.is_some()
+                || crate::shared::worker::has_active_workers()
+                || self
+                    .app
+                    .state
+                    .workspaces
+                    .iter()
+                    .any(|workspace| workspace.isolated_execution)
+            {
+                let _=msg.respond_to.send(serde_json::json!({"id":msg.request.id,"error":{"code":"sharing_active","message":"disable session sharing and isolated workspace execution before live handoff"}}).to_string());
+                return false;
+            }
             let handoff_result = self.perform_live_handoff(params.clone());
             let handoff_succeeded = handoff_result.is_ok();
             let response = match handoff_result {
@@ -2989,6 +3178,33 @@ impl HeadlessServer {
             return changed;
         }
 
+        // Keep the shared policy lock through execution so an acknowledged
+        // revoke cannot race between authorization and the native action.
+        let _shared_policy_guard =
+            if let Some(scope) = msg.shared_scope.as_ref() {
+                match scope.authorize_execution(&self.app, &msg.request) {
+                    Some(guard) => Some(guard),
+                    None => {
+                        let _ = msg.respond_to.send(
+                            crate::shared::scope::SharedScope::denied_response(&msg.request),
+                        );
+                        return changed;
+                    }
+                }
+            } else {
+                None
+            };
+
+        if msg
+            .native_client_id
+            .is_some_and(|id| !self.shared_method_allowed(id, &msg.request.method))
+        {
+            if let Some(id) = msg.native_client_id {
+                self.audit_shared_client(id, msg.request.method.operation().name, "denied", None);
+            }
+            let _=msg.respond_to.send(serde_json::json!({"id":msg.request.id,"error":{"code":"unavailable","message":"object unavailable or access denied"}}).to_string());
+            return changed;
+        }
         // Capture toast and effective pane states before the API call so we can
         // forward resulting client-local notifications. API requests like
         // pane.report_agent trigger handle_internal_event internally, which
@@ -3063,6 +3279,18 @@ impl HeadlessServer {
         }) {
             self.app.state.view.terminal_area =
                 Rect::new(0, 0, self.effective_size.0, self.effective_size.1);
+        }
+        if msg
+            .shared_scope
+            .as_ref()
+            .is_some_and(|scope| !scope.unexpired() || !scope.validates(&self.app, &msg.request))
+        {
+            let _ = msg
+                .respond_to
+                .send(crate::shared::scope::SharedScope::denied_response(
+                    &msg.request,
+                ));
+            return changed;
         }
         let mut response = if matches!(
             &msg.request.method,
@@ -3262,7 +3490,7 @@ impl HeadlessServer {
             }
         }
 
-        if !skip_default_workspace && latest_shell_client(&self.clients).is_some() {
+        if !skip_default_workspace && self.latest_private_shell_client().is_some() {
             changed |= self.app.ensure_default_workspace();
         }
 
