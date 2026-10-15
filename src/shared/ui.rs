@@ -1,4 +1,5 @@
 //! Shared clients use a deliberately bounded JSON surface, never owner sockets.
+use std::collections::HashMap;
 use std::io::{self, IsTerminal};
 use std::path::Path;
 use std::time::{Duration, Instant};
@@ -333,6 +334,39 @@ fn api_key(key: KeyEvent) -> Option<String> {
     Some(result)
 }
 
+fn connected_counts(users: &Value) -> HashMap<u64, usize> {
+    let mut counts = HashMap::new();
+    for client in rows(users, "connected") {
+        if let Some(uid) = client["uid"].as_u64() {
+            *counts.entry(uid).or_insert(0) += 1;
+        }
+    }
+    counts
+}
+
+fn account_row(account: &Value, connected: &HashMap<u64, usize>) -> String {
+    let count = account["uid"]
+        .as_u64()
+        .and_then(|uid| connected.get(&uid))
+        .copied()
+        .unwrap_or(0);
+    format!(
+        "{} (UID {}){}{}",
+        text(account, "name"),
+        account["uid"],
+        if account["unresolved"] == true {
+            " [unresolved]"
+        } else {
+            ""
+        },
+        if count == 0 {
+            String::new()
+        } else {
+            format!(" [connected: {count}]")
+        }
+    )
+}
+
 pub(super) fn admin(socket: &Path, owner: u32) -> io::Result<()> {
     let status = broker::request(socket, owner, "status", json!({}))?;
     let state = broker::request(socket, owner, "grants.get", json!({}))?;
@@ -340,6 +374,8 @@ pub(super) fn admin(socket: &Path, owner: u32) -> io::Result<()> {
     let space_state = broker::request(socket, owner, "spaces", json!({}))?;
     let _screen = Screen::enter()?;
     let mut terminal = terminal()?;
+    let mut connected = connected_counts(&users);
+    let mut connections_refreshed = Instant::now();
     let mut accounts = rows(&users, "accounts");
     for grant in rows(&state, "grants") {
         if !accounts
@@ -365,11 +401,21 @@ pub(super) fn admin(socket: &Path, owner: u32) -> io::Result<()> {
     let mut user_state = ListState::default();
     let mut space_state = ListState::default();
     loop {
+        if connections_refreshed.elapsed() >= Duration::from_secs(1) {
+            match broker::request(socket, owner, "users", json!({})) {
+                Ok(users) => connected = connected_counts(&users),
+                Err(error) => {
+                    connected.clear();
+                    message = format!("Connection status unavailable: {error}");
+                }
+            }
+            connections_refreshed = Instant::now();
+        }
         terminal.draw(|frame| {
             let bands=frame_rows(frame.area());
             frame.render_widget(Paragraph::new("Space access · Owner administration\nTab switch column · arrows select · Space change role · s save · r revoke user · d disable sharing · / search · q cancel"),bands[0]);
             areas=Layout::default().direction(Direction::Horizontal).constraints([Constraint::Percentage(38),Constraint::Percentage(62)]).split(bands[1]).to_vec();
-            let list=accounts.iter().enumerate().map(|(i,user)|ListItem::new(format!("{} (UID {}){}",text(user,"name"),user["uid"],if user["unresolved"]==true {" [unresolved]"} else {""})).style(selected_style(i==user_index&&user_focus))).collect::<Vec<_>>();
+            let list=accounts.iter().enumerate().map(|(i,user)|ListItem::new(account_row(user, &connected)).style(selected_style(i==user_index&&user_focus))).collect::<Vec<_>>();
             user_state.select(Some(user_index));
             frame.render_stateful_widget(List::new(list).block(Block::default().borders(Borders::ALL).title("OS accounts")),areas[0],&mut user_state);
             let selected=accounts.get(user_index);
@@ -382,6 +428,9 @@ pub(super) fn admin(socket: &Path, owner: u32) -> io::Result<()> {
             let footer=if confirm_disable {"Disable sharing for all participants? y / n (running terminals continue)".into()} else if confirm {format!("Control lets this user run commands as {} and access that account's files and credentials. Grant Control? y / n",text(&status,"execution_user"))} else if let Some(query)=&query {format!("OS account search: {query} (Enter search, Esc cancel)")} else {message.clone()};
             frame.render_widget(Paragraph::new(footer).wrap(Wrap {trim:false}).style(Style::default().fg(Color::Yellow)),bands[2]);
         })?;
+        if !event::poll(Duration::from_millis(250))? {
+            continue;
+        }
         let event = event::read()?;
         if let Event::Mouse(mouse) = event {
             if mouse.kind == MouseEventKind::Down(MouseButton::Left) && areas.len() == 2 {
@@ -443,6 +492,7 @@ pub(super) fn admin(socket: &Path, owner: u32) -> io::Result<()> {
                 KeyCode::Enter => {
                     match broker::request(socket, owner, "users", json!({"query":search})) {
                         Ok(result) => {
+                            connected = connected_counts(&result);
                             accounts = rows(&result, "accounts");
                             user_index = 0;
                         }
@@ -530,6 +580,29 @@ fn replace_role(grants: &mut Vec<Value>, user: &Value, space: &Value, role: Opti
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn owner_account_rows_count_live_clients_without_marking_offline_users() {
+        let users = json!({"connected":[{"uid":1001,"account_name":"alice"},{"uid":1001,"account_name":"alice"},{"uid":1002,"account_name":"bob"}]});
+        let counts = connected_counts(&users);
+        assert_eq!(
+            account_row(&json!({"uid":1001,"name":"alice"}), &counts),
+            "alice (UID 1001) [connected: 2]"
+        );
+        assert_eq!(
+            account_row(&json!({"uid":1002,"name":"bob"}), &counts),
+            "bob (UID 1002) [connected: 1]"
+        );
+        assert_eq!(
+            account_row(&json!({"uid":1003,"name":"eve","unresolved":true}), &counts),
+            "eve (UID 1003) [unresolved]"
+        );
+        assert!(!account_row(
+            &json!({"uid":1001,"name":"alice"}),
+            &connected_counts(&json!({"connected":[]}))
+        )
+        .contains("connected"));
+    }
+
     #[test]
     fn changing_one_grant_preserves_other_users_and_spaces() {
         let user = json!({"uid":1001,"name":"alice"});

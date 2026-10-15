@@ -57,7 +57,7 @@ use transport::*;
 
 #[cfg(test)]
 pub(crate) use shell::{ClientShellConfig, ClientShellState};
-pub use startup::{run_client, run_terminal_attach};
+pub use startup::{run_client, run_shared_client, run_terminal_attach};
 pub use terminal_sessions::{run_terminal_session_control, run_terminal_session_observe};
 
 #[cfg(not(windows))]
@@ -172,10 +172,17 @@ fn negotiated_surface_decoder(
     (reuse || delta || scroll).then(|| protocol::surface_reuse::Decoder::new(delta, scroll))
 }
 
+#[derive(Clone)]
+struct SharedClientTarget {
+    socket_path: std::path::PathBuf,
+    owner_uid: u32,
+}
+
 fn run_client_with_mode(
     attach_request: Option<(String, bool)>,
     attach_escape: Option<AttachEscapeState>,
     log_message: &'static str,
+    shared: Option<SharedClientTarget>,
 ) -> io::Result<()> {
     init_logging();
 
@@ -186,7 +193,10 @@ fn run_client_with_mode(
     #[cfg(not(windows))]
     crate::terminal_modes::clear_host_mouse_reporting(&mut io::stdout())?;
     let client_rendered_shell = attach_request.is_none();
-    let socket_path = client_socket_path();
+    let socket_path = shared
+        .as_ref()
+        .map(|target| target.socket_path.clone())
+        .unwrap_or_else(client_socket_path);
     let keybinding_source = client_shell_keybinding_source();
     let startup_config_diagnostic =
         if keybinding_source == shell::ClientShellKeybindingSource::Endpoint {
@@ -232,18 +242,30 @@ fn run_client_with_mode(
     crate::logging::startup("client");
     info!(path = %socket_path.display(), "{log_message}");
 
-    let endpoint_catalog = if client_rendered_shell && !is_remote_client_process() {
-        endpoint::EndpointCatalog::load().unwrap_or_else(|error| {
-            warn!(%error, "saved SSH endpoint catalog is unavailable");
+    let endpoint_catalog =
+        if client_rendered_shell && !is_remote_client_process() && shared.is_none() {
+            endpoint::EndpointCatalog::load().unwrap_or_else(|error| {
+                warn!(%error, "saved SSH endpoint catalog is unavailable");
+                endpoint::EndpointCatalog::default()
+            })
+        } else {
             endpoint::EndpointCatalog::default()
-        })
-    } else {
-        endpoint::EndpointCatalog::default()
-    };
+        };
     let federated = endpoint_catalog.has_enabled_ssh();
 
     let initial_stream = match crate::ipc::connect_local_stream(&socket_path) {
-        Ok(stream) => Some(stream),
+        Ok(stream) => {
+            if let Some(target) = &shared {
+                let identity = crate::platform::local_stream_peer_identity(&stream)?;
+                if identity.uid != target.owner_uid {
+                    return Err(io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        "shared session server identity does not match the selected owner",
+                    ));
+                }
+            }
+            Some(stream)
+        }
         Err(error) if federated => {
             warn!(%error, "Local is unavailable; keeping saved machines available");
             None
@@ -295,10 +317,20 @@ fn run_client_with_mode(
                 endpoint_keybindings,
                 loop_config.mouse_capture_active,
                 true,
-                !is_remote_client_process(),
+                !is_remote_client_process() && shared.is_none(),
+                shared.is_some(),
                 &AtomicBool::new(false),
             )
             .map_err(|error| io::Error::other(error.to_string()))?;
+            let shared_capable = handshake.endpoint_capabilities.as_ref().is_some_and(|caps| {
+                caps.iter().any(|cap| cap == crate::protocol::endpoint::SHARED_ACCESS_CAPABILITY)
+            });
+            if shared.is_some() && !shared_capable {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "endpoint did not negotiate shared access",
+                ));
+            }
             if federated
                 && !endpoint::EndpointNegotiation::new(
                     handshake.endpoint_methods.clone().unwrap_or_default(),
@@ -370,15 +402,32 @@ fn run_client_with_mode(
             loop_config,
             attach_escape,
             &terminal_guard,
+            shared.is_some(),
         )
         .await
     });
 
+    // Never retain a participant's terminal contents when its authorization or
+    // transport ends; this also covers revocation during a blocked stream.
+    if shared.is_some() {
+        let _ = crossterm::execute!(
+            io::stdout(),
+            crossterm::terminal::Clear(crossterm::terminal::ClearType::All),
+            crossterm::cursor::MoveTo(0, 0)
+        );
+    }
     // Restore the terminal before printing any final status message.
     let terminal_restore_failed = terminal_guard.restore().is_err();
 
     if let Err(err) = result {
-        let _ = writeln!(io::stderr(), "herdr: {err}");
+        if shared.is_some() {
+            let _ = writeln!(
+                io::stderr(),
+                "herdr: shared session disconnected; access may have changed: {err}"
+            );
+        } else {
+            let _ = writeln!(io::stderr(), "herdr: {err}");
+        }
         rt.shutdown_timeout(Duration::from_millis(100));
         crate::logging::shutdown("client");
 
@@ -434,6 +483,9 @@ fn graphics_owner_is_active(
 /// - resize poller thread → sends resize events to main loop
 /// - server reader thread → reads ServerMessages and sends to main loop
 /// - main loop: coordinates input, output, and server communication
+// Shared admission is one additional lifecycle option; retain the established
+// geometry, cancellation and terminal guard boundary rather than refactoring it.
+#[allow(clippy::too_many_arguments)]
 async fn run_client_loop(
     initial: Option<(LocalStream, handshake::HandshakeResult)>,
     mut endpoint_catalog: endpoint::EndpointCatalog,
@@ -446,6 +498,7 @@ async fn run_client_loop(
     mut config: ClientLoopConfig,
     attach_escape: Option<AttachEscapeState>,
     _terminal_guard: &TerminalGuard,
+    shared_client: bool,
 ) -> Result<(), ClientError> {
     #[cfg(windows)]
     let _ = config.mouse_scroll_lines;
@@ -541,6 +594,11 @@ async fn run_client_loop(
 
     let mut endpoint_commands = endpoint_commands::EndpointCommands::default();
 
+    #[cfg(unix)]
+    let stdin_ownership = Arc::new(Mutex::new(()));
+    #[cfg(unix)]
+    let reader_stdin_ownership = stdin_ownership.clone();
+
     // Spawn the stdin reader thread.
     let will_query_host_terminal_theme = state.attach_escape.is_none();
     let host_theme_query_pending = Arc::new(AtomicU32::new(0));
@@ -564,6 +622,8 @@ async fn run_client_loop(
     std::thread::spawn(move || {
         input::stdin_reader_loop(
             stdin_tx,
+            #[cfg(unix)]
+            reader_stdin_ownership,
             &stdin_quit,
             will_query_host_terminal_theme,
             stdin_host_theme_query_pending,
@@ -660,11 +720,22 @@ async fn run_client_loop(
             state.present_frame(frame);
         }
     }
+    if !shared_client && !is_remote_client && crate::platform::effective_uid().is_ok() {
+        if let Some(shell) = state.shell.as_mut() {
+            shell.enable_owner_space_access();
+        }
+    }
+    if shared_client {
+        if let Some(shell) = state.shell.as_mut() {
+            shell.require_shared_access();
+        }
+    }
     let mut next_surface_serial = 1_u64;
     let mut pending_activation: Option<endpoint::PendingEndpointActivation> = None;
     let mut scheduled_activation = None;
     let mut pending_catalog: Option<Result<Vec<endpoint::SavedSshEndpoint>, String>> = None;
-    if state.shell.is_some() && !is_remote_client && state.attach_escape.is_none() {
+    if state.shell.is_some() && !is_remote_client && !shared_client && state.attach_escape.is_none()
+    {
         catalog_reload::watch_profiles(event_tx.clone(), should_quit.clone());
     }
 
@@ -675,7 +746,10 @@ async fn run_client_loop(
     // Main event loop.
     let mut client_timer = timer::ClientLoopTimer::new();
     let mut power_monitor = crate::platform::HostPowerMonitor::start(
-        state.shell.is_some() && !is_remote_client && state.attach_escape.is_none(),
+        state.shell.is_some()
+            && !is_remote_client
+            && !shared_client
+            && state.attach_escape.is_none(),
     );
     #[cfg(windows)]
     let mut stdin_open = true;
@@ -842,6 +916,48 @@ async fn run_client_loop(
         }
 
         match event {
+            ClientLoopEvent::OwnerSpaceAccess => {
+                #[cfg(unix)]
+                if state
+                    .shell
+                    .as_ref()
+                    .is_some_and(|shell| shell.owner_space_access_available())
+                {
+                    let _input = stdin_ownership.lock().map_err(|_| {
+                        ClientError::ConnectionLost(io::Error::other(
+                            "stdin ownership lock poisoned",
+                        ))
+                    })?;
+                    if let Some(shell) = state.shell.as_mut() {
+                        frame_output::write_composed_frame(
+                            io::stdout(),
+                            &[],
+                            &shell.suspend_graphics(),
+                            &mut state.image_files,
+                        )
+                        .map_err(ClientError::ConnectionLost)?;
+                    }
+                    let result = _terminal_guard
+                        .with_owner_admin_screen(
+                            state.mouse_capture_active,
+                            host_sgr_pixels_active.load(Ordering::Acquire),
+                            state.keyboard_report_all_active,
+                            crate::shared::run_owner_admin,
+                        )
+                        .map_err(ClientError::ConnectionLost)?;
+                    if let Err(error) = result {
+                        if let Some(shell) = state.shell.as_mut() {
+                            shell.receive_endpoint_unavailable(format!("Space access: {error}"));
+                        }
+                    }
+                    state.request_repaint();
+                    if let Some(frame) = state.shell.as_mut().and_then(|shell| {
+                        shell.compose(state.reported_size.0, state.reported_size.1)
+                    }) {
+                        state.present_frame(frame);
+                    }
+                }
+            }
             ClientLoopEvent::HostPower(event) => {
                 if supervisors.host_power_event(event, now) {
                     write_stream.resume_health(now);
@@ -1658,8 +1774,10 @@ async fn run_client_loop(
                     } => {
                         // Never interpret an SSH server's filesystem path on this host,
                         // including legacy peers that send files without negotiation.
-                        if !server_graphics_files_allowed(&endpoint_id, is_remote_client_process())
-                        {
+                        if !server_graphics_files_allowed(
+                            &endpoint_id,
+                            is_remote_client_process() || shared_client,
+                        ) {
                             write_stream.send_to(
                                 &endpoint_id,
                                 &ClientMessage::GraphicsTransmissionResult {
@@ -2091,6 +2209,26 @@ async fn run_client_loop(
                         }
                     }
                     ServerMessage::EndpointControl { kind, data } => {
+                        if kind == "shared.access.v1" {
+                            if shared_client {
+                                let access = serde_json::from_str(&data).map_err(|error| {
+                                    ClientError::ConnectionLost(io::Error::new(
+                                        io::ErrorKind::InvalidData,
+                                        error,
+                                    ))
+                                })?;
+                                if let Some(shell) = state.shell.as_mut() {
+                                    shell.set_shared_access(access);
+                                }
+                                state.request_repaint();
+                                if let Some(frame) = state.shell.as_mut().and_then(|shell| {
+                                    shell.compose(state.reported_size.0, state.reported_size.1)
+                                }) {
+                                    state.present_frame(frame);
+                                }
+                            }
+                            continue;
+                        }
                         if kind == crate::protocol::endpoint::PRESENTATION_EFFECTS_READY_KIND {
                             let progress = pending_activation.as_mut().map(|activation| {
                                 activation.receive_presentation_effects_ready(

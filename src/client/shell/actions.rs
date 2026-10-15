@@ -6,6 +6,42 @@ impl ClientShellState {
         binding: crate::input::KeybindMatch,
         outcome: &mut ClientShellInput,
     ) {
+        let workspace = self
+            .snapshot
+            .as_ref()
+            .and_then(|snapshot| snapshot.focused_workspace_id.as_deref());
+        if !self.shared_workspace_control(workspace) {
+            use crate::input::KeybindAction as Action;
+            let allowed = matches!(
+                &binding,
+                crate::input::KeybindMatch::Action(
+                    Action::SwitchWorkspace(_)
+                        | Action::SwitchTab(_)
+                        | Action::FocusAgent(_)
+                        | Action::WorkspacePicker
+                        | Action::PreviousWorkspace
+                        | Action::NextWorkspace
+                        | Action::PreviousAgent
+                        | Action::NextAgent
+                        | Action::PreviousTab
+                        | Action::NextTab
+                        | Action::CopyMode
+                        | Action::ToggleSidebar
+                        | Action::Help
+                        | Action::Settings
+                        | Action::OpenNotificationTarget
+                        | Action::Detach
+                        | Action::OpenNavigator
+                )
+            );
+            if !allowed {
+                self.receive_endpoint_unavailable(
+                    "This space is View only; ask the session owner for Control access".into(),
+                );
+                outcome.repaint = true;
+                return;
+            }
+        }
         match binding {
             crate::input::KeybindMatch::Action(crate::input::KeybindAction::Detach) => {
                 outcome.detach = true;

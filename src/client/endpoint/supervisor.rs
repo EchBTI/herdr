@@ -498,6 +498,7 @@ fn connect_once(
         options.mouse_capture,
         false,
         matches!(target, ConnectTarget::Local(_)),
+        false,
         &cancelled,
     )
     .map_err(handshake_error)?;

@@ -484,7 +484,14 @@ impl Context<'_> {
                         let accounts:Vec<_> = accounts.into_iter().map(|account| json!({
                             "uid":account.uid,"name":account.name,"description":account.description,
                         })).collect();
-                        json!({"accounts":accounts})
+                        {
+                            let live = crate::shared::native::control(
+                                &self.client.socket_path(),
+                                crate::shared::native::NativeCommand::Clients,
+                            )
+                            .map_err(|_| denied())?;
+                            json!({"accounts":accounts,"connected":live["clients"]})
+                        }
                     }
                     "grants.get" => {
                         only_fields(params, &[])?;
@@ -518,6 +525,11 @@ impl Context<'_> {
                             .replace_grants(&caller, revision, grants, acknowledgement)
                             .map_err(|_| invalid())?;
                         self.store.save(&candidate).map_err(|_| denied())?;
+                        crate::shared::native::control(
+                            &self.client.socket_path(),
+                            crate::shared::native::NativeCommand::Refresh,
+                        )
+                        .map_err(|_| denied())?;
                         json!({"revision":candidate.revision(),"grants":candidate.grants()})
                     }
                     _ => {
@@ -574,6 +586,17 @@ pub(super) fn serve(
     );
     load(&store)?;
     let listener = shared_transport::bind_listener(socket, group_gid)?;
+    if let Err(error) = crate::shared::native::control(
+        private_api,
+        crate::shared::native::NativeCommand::Enable {
+            socket_path: socket.with_file_name("native"),
+            group_gid,
+            policy_directory: runtime_policy_dir.clone(),
+        },
+    ) {
+        let _ = shared_transport::remove_socket(socket);
+        return Err(error);
+    }
     let context = Context {
         store: &store,
         client: &client,
@@ -616,6 +639,18 @@ pub(super) fn serve(
                 false,
             ),
         };
+        if stop {
+            if let Err(error) = crate::shared::native::control(
+                private_api,
+                crate::shared::native::NativeCommand::Disable,
+            ) {
+                // A stopped/replaced runtime cannot retain live native clients.
+                // If it is still alive, require its revocation acknowledgement.
+                if client.runtime_identity().ok().as_deref() == Some(runtime_identity.as_str()) {
+                    return Err(error);
+                }
+            }
+        }
         let _ = write_value(&mut stream, &response);
         if stop {
             return Ok(());

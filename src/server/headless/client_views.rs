@@ -76,7 +76,28 @@ impl HeadlessServer {
                 workspace_index,
                 tab_index,
             })
-            .or_else(|| self.default_shell_target())
+            .filter(|target| self.shared_can_read(client_id, target.workspace_index))
+            .or_else(|| self.default_shell_target_for_client(client_id))
+    }
+
+    fn default_shell_target_for_client(
+        &self,
+        client_id: u64,
+    ) -> Option<crate::ui::TabSurfaceTarget> {
+        self.default_shell_target()
+            .filter(|target| self.shared_can_read(client_id, target.workspace_index))
+            .or_else(|| {
+                self.app.state.workspaces.iter().enumerate().find_map(
+                    |(workspace_index, workspace)| {
+                        self.shared_can_read(client_id, workspace_index).then_some(
+                            crate::ui::TabSurfaceTarget {
+                                workspace_index,
+                                tab_index: workspace.active_tab_index(),
+                            },
+                        )
+                    },
+                )
+            })
     }
 
     fn tab_id_for_target(&self, target: crate::ui::TabSurfaceTarget) -> Option<String> {
@@ -89,21 +110,29 @@ impl HeadlessServer {
             .and_then(|target| self.tab_id_for_target(target))
     }
 
-    fn client_shell_topology(&self) -> ClientShellTopology {
+    fn client_shell_topology(&self, client_id: Option<u64>) -> ClientShellTopology {
         let focused_workspace_id = self
             .app
             .state
             .active
+            .filter(|&workspace_index| {
+                client_id.is_none_or(|id| self.shared_can_read(id, workspace_index))
+            })
             .map(|workspace_index| self.app.public_workspace_id(workspace_index));
         let fallback_workspace_id = self
             .app
             .state
             .workspaces
-            .first()
-            .map(|_| self.app.public_workspace_id(0));
+            .iter()
+            .enumerate()
+            .find(|(index, _)| client_id.is_none_or(|id| self.shared_can_read(id, *index)))
+            .map(|(index, _)| self.app.public_workspace_id(index));
         let mut active_tab_ids = HashMap::new();
         let mut tab_workspace_ids = HashMap::new();
         for (workspace_index, workspace) in self.app.state.workspaces.iter().enumerate() {
+            if !client_id.is_none_or(|id| self.shared_can_read(id, workspace_index)) {
+                continue;
+            }
             let workspace_id = self.app.public_workspace_id(workspace_index);
             if let Some(tab_id) = self
                 .app
@@ -140,23 +169,33 @@ impl HeadlessServer {
                 .default_shell_target()
                 .and_then(|target| self.tab_id_for_target(target));
         }
-        let topology = self.client_shell_topology();
+        let owner_topology = self.client_shell_topology(None);
         let live_clients = self.clients.keys().copied().collect::<HashSet<_>>();
         self.tab_geometry_controllers.retain(|tab_id, client_id| {
-            topology.tab_workspace_ids.contains_key(tab_id) && live_clients.contains(client_id)
+            owner_topology.tab_workspace_ids.contains_key(tab_id)
+                && live_clients.contains(client_id)
         });
-        for client in self
+        // Trusted local clients share a single topology calculation. Only
+        // participants need a separately restricted resource projection.
+        let topologies = self
             .clients
-            .values_mut()
-            .filter(|client| client.is_shell_client())
+            .iter()
+            .filter(|(&id, client)| client.is_shell_client() && self.shared_is_participant(id))
+            .map(|(&id, _)| (id, self.client_shell_topology(Some(id))))
+            .collect::<HashMap<_, _>>();
+        for (&client_id, client) in self
+            .clients
+            .iter_mut()
+            .filter(|(_, client)| client.is_shell_client())
         {
+            let topology = topologies.get(&client_id).unwrap_or(&owner_topology);
             let location = client.shell_location.get_or_insert_with(|| {
                 crate::server::clients::ClientShellLocation {
                     focused_workspace_id: topology.focused_workspace_id.clone(),
                     active_tab_ids: topology.active_tab_ids.clone(),
                 }
             });
-            location.reconcile(&topology);
+            location.reconcile(topology);
         }
     }
 
@@ -170,11 +209,20 @@ impl HeadlessServer {
         };
         let focus_before = self.shell_focus_targets();
         let focused_tabs_before = self.focused_shell_tabs();
-        for client in self
+        let allowed_clients = self
             .clients
-            .values_mut()
-            .filter(|client| client.is_shell_client())
+            .keys()
+            .copied()
+            .filter(|&id| self.shared_can_read(id, target.workspace_index))
+            .collect::<HashSet<_>>();
+        for (&client_id, client) in self
+            .clients
+            .iter_mut()
+            .filter(|(_, client)| client.is_shell_client())
         {
+            if !allowed_clients.contains(&client_id) {
+                continue;
+            }
             if let Some(location) = client.shell_location.as_mut() {
                 location.focus_tab(workspace_id.clone(), tab_id.clone());
             }
@@ -189,6 +237,9 @@ impl HeadlessServer {
         let Some((workspace_index, _)) = self.app.parse_tab_id(tab_id) else {
             return false;
         };
+        if !self.shared_can_read(client_id, workspace_index) {
+            return false;
+        }
         let workspace_id = self.app.public_workspace_id(workspace_index);
         let Some(client) = self.clients.get_mut(&client_id) else {
             return false;
@@ -387,7 +438,11 @@ impl HeadlessServer {
     }
 
     pub(super) fn shell_focus_target(&self, client_id: u64) -> Option<ShellFocusTarget> {
-        self.focus_target_for_surface(self.shell_target_for_client(client_id)?)
+        let target = self.shell_target_for_client(client_id)?;
+        if !self.shared_can_control(client_id, target.workspace_index) {
+            return None;
+        }
+        self.focus_target_for_surface(target)
     }
 
     pub(super) fn focused_shell_tabs(&self) -> HashSet<String> {
@@ -396,7 +451,12 @@ impl HeadlessServer {
             .filter(|(_, client)| {
                 client.is_active_shell_client() && client.outer_terminal_focus == Some(true)
             })
-            .filter_map(|(&client_id, _)| self.shell_tab_id_for_client(client_id))
+            .filter_map(|(&client_id, _)| {
+                let target = self.shell_target_for_client(client_id)?;
+                self.shared_can_control(client_id, target.workspace_index)
+                    .then(|| self.shell_tab_id_for_client(client_id))
+                    .flatten()
+            })
             .collect()
     }
 
@@ -567,6 +627,9 @@ impl HeadlessServer {
         client_id: u64,
         target: crate::ui::TabSurfaceTarget,
     ) -> bool {
+        if !self.shared_can_control(client_id, target.workspace_index) {
+            return false;
+        }
         let Some(client) = self.clients.get(&client_id) else {
             return false;
         };
@@ -577,7 +640,7 @@ impl HeadlessServer {
             crate::kitty_graphics::HostCellSize::default()
         };
         let area = Rect::new(0, 0, cols, rows);
-        if self.app_client_count() == 1 {
+        if self.app_client_count() == 1 && !self.shared_is_participant(client_id) {
             for (workspace_index, workspace) in self.app.state.workspaces.iter().enumerate() {
                 for tab_index in 0..workspace.tabs.len() {
                     crate::ui::resize_tab_surface(
@@ -642,6 +705,12 @@ impl HeadlessServer {
             let Some(tab_id) = self.shell_tab_id_for_client(client_id) else {
                 continue;
             };
+            let Some(target) = self.shell_target_for_client(client_id) else {
+                continue;
+            };
+            if !self.shared_can_control(client_id, target.workspace_index) {
+                continue;
+            }
             viewed_tabs.entry(tab_id).or_default().push(client_id);
         }
         for viewers in viewed_tabs.values_mut() {
@@ -702,6 +771,12 @@ impl HeadlessServer {
         {
             return false;
         }
+        if !self
+            .shell_target_for_client(client_id)
+            .is_some_and(|target| self.shared_can_control(client_id, target.workspace_index))
+        {
+            return false;
+        }
         let Some(tab_id) = self.shell_tab_id_for_client(client_id) else {
             return false;
         };
@@ -720,6 +795,12 @@ impl HeadlessServer {
             .clients
             .get(&client_id)
             .is_some_and(|client| client.shell_surface_active)
+        {
+            return false;
+        }
+        if !self
+            .shell_target_for_client(client_id)
+            .is_some_and(|target| self.shared_can_control(client_id, target.workspace_index))
         {
             return false;
         }
@@ -912,6 +993,63 @@ impl HeadlessServer {
         client_id: u64,
         msg: api::ApiRequestMessage,
     ) -> bool {
+        if !self.shared_method_allowed(client_id, &msg.request.method) {
+            let _ = msg
+                .respond_to
+                .send(crate::server::client_commands::error_response(
+                    msg.request.id,
+                    "unavailable",
+                    "object unavailable or access denied",
+                ));
+            return false;
+        }
+        let navigation_workspace = match &msg.request.method {
+            api::schema::Method::WorkspaceFocus(params) => {
+                self.app.parse_workspace_id(&params.workspace_id)
+            }
+            api::schema::Method::TabFocus(params) => self
+                .app
+                .parse_tab_id(&params.tab_id)
+                .map(|(index, _)| index),
+            _ => None,
+        };
+        if self.shared_is_participant(client_id)
+            && navigation_workspace.is_some_and(|index| self.shared_can_read(client_id, index))
+            && (navigation_workspace
+                .is_some_and(|index| !self.shared_can_control(client_id, index))
+                || !self
+                    .shell_target_for_client(client_id)
+                    .is_some_and(|target| {
+                        self.shared_can_control(client_id, target.workspace_index)
+                    }))
+        {
+            // View navigation is presentation state. It must not change the
+            // session's active workspace, PTY focus reports or shared geometry.
+            let changed = self.apply_shell_navigation_request(client_id, &msg.request.method);
+            if let Ok(response) = serde_json::to_string(&api::schema::SuccessResponse {
+                id: msg.request.id,
+                result: api::schema::ResponseResult::Ok {},
+            }) {
+                let _ = msg.respond_to.send(response);
+            }
+            return changed;
+        }
+        if self.shared_is_participant(client_id)
+            && matches!(
+                msg.request.method,
+                api::schema::Method::PaneLayout(_)
+                    | api::schema::Method::PaneGet(_)
+                    | api::schema::Method::PaneRead(_)
+                    | api::schema::Method::PaneSelectionRead(_)
+                    | api::schema::Method::PaneLinkResolve(_)
+                    | api::schema::Method::PaneEdges(_)
+                    | api::schema::Method::PaneNeighbor(_)
+            )
+        {
+            // Endpoint admission resolves these requests to explicit permitted
+            // resources. Reading them never needs the session's global focus.
+            return self.handle_api_request_with_shutdown_check_inner(msg, false, true);
+        }
         let focus_before = self.shell_focus_target(client_id);
         let focused_tabs_before = self.focused_shell_tabs();
         let method_claims_geometry = Self::shell_endpoint_claims_geometry(&msg.request.method);

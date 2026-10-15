@@ -350,6 +350,42 @@ fn handle_connection_with_stop(
     // A new private method fails closed against older daemons, which reject
     // unknown methods instead of silently ignoring an authorization field.
     let raw: serde_json::Value = serde_json::from_str(line).unwrap_or_default();
+    if raw.get("method").and_then(serde_json::Value::as_str) == Some("shared.native.v1") {
+        let id = raw["id"].as_str().unwrap_or_default().to_owned();
+        let command =
+            serde_json::from_value::<crate::shared::native::NativeCommand>(raw["params"].clone());
+        let response = match command {
+            Ok(command) => {
+                let (respond_to, response_rx) = std::sync::mpsc::channel();
+                let message = crate::api::ApiRequestMessage {
+                    native_shared: Some(command),
+                    native_client_id: None,
+                    shared_scope: None,
+                    request: Request {
+                        id: id.clone(),
+                        method: Method::Ping(Default::default()),
+                    },
+                    respond_to,
+                    response_write_complete: None,
+                };
+                if api_tx.send(message).is_err() {
+                    error_response_json(id, "unavailable", "server unavailable".into())
+                } else {
+                    response_rx
+                        .recv_timeout(Duration::from_secs(5))
+                        .unwrap_or_else(|_| {
+                            error_response_json(id, "unavailable", "server unavailable".into())
+                        })
+                }
+            }
+            Err(_) => error_response_json(
+                id,
+                "invalid_request",
+                "invalid native sharing command".into(),
+            ),
+        };
+        return write_text_line_allow_disconnect(&mut stream, &response);
+    }
     if raw.get("method").and_then(serde_json::Value::as_str) == Some("shared.execute.v1") {
         #[derive(serde::Deserialize)]
         #[serde(deny_unknown_fields)]
@@ -998,6 +1034,8 @@ fn dispatch_to_app(
     let request_id = request.id.clone();
     let (respond_to, response_rx) = std::sync::mpsc::channel();
     if let Err(err) = api_tx.send(ApiRequestMessage {
+        native_shared: None,
+        native_client_id: None,
         request,
         respond_to,
         shared_scope: None,
@@ -1895,6 +1933,8 @@ fn dispatch_scoped_to_app(
     let (respond_to, response_rx) = std::sync::mpsc::channel();
     if api_tx
         .send(ApiRequestMessage {
+            native_shared: None,
+            native_client_id: None,
             request,
             respond_to,
             response_write_complete: None,

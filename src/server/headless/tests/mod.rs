@@ -6,6 +6,7 @@ mod native_graphics;
 mod pane_move_tests;
 #[path = "pane_graphics.rs"]
 mod retained_graphics_tests;
+mod shared_access;
 #[path = "surface_delta.rs"]
 mod surface_delta_tests;
 #[path = "surface_interest.rs"]
@@ -99,6 +100,8 @@ fn test_headless_server_with_event_hub(event_hub: api::EventHub) -> HeadlessServ
     let headless_size = app.state.headless_size;
 
     HeadlessServer {
+        native_shared: None,
+
         app,
         #[cfg(unix)]
         api_tx: None,
@@ -251,6 +254,8 @@ async fn headless_api_reads_latest_title_without_spinner_event_flooding() {
 fn headless_pane_list(server: &mut HeadlessServer) -> Vec<api::schema::PaneInfo> {
     let (respond_to, response_rx) = std::sync::mpsc::channel();
     server.handle_api_request_with_shutdown_check(api::ApiRequestMessage {
+        native_shared: None,
+        native_client_id: None,
         request: api::schema::Request {
             id: "list-titles".into(),
             method: api::schema::Method::PaneList(api::schema::PaneListParams::default()),
@@ -309,6 +314,8 @@ fn headless_api_request_drains_all_pending_internal_events_before_reading_state(
     let (respond_to, response_rx) = std::sync::mpsc::channel();
     assert!(
         server.handle_api_request_with_shutdown_check(api::ApiRequestMessage {
+            native_shared: None,
+            native_client_id: None,
             request: api::schema::Request {
                 id: "headless_stop_after_events".into(),
                 method: api::schema::Method::ServerStop(api::schema::EmptyParams::default()),
@@ -728,6 +735,7 @@ async fn client_shell_attach_seeds_workspace() {
 
     assert!(
         server.handle_server_event(ServerEvent::ClientShellConnected {
+            auth: None,
             surface_reuse: false,
             surface_delta: false,
             surface_scroll: false,
@@ -761,6 +769,7 @@ async fn completion_guard_endpoint_pairs_runtime_completions_with_snapshots() {
     server.app.state.active = Some(0);
     let (writer, control_rx, _render_rx) = test_client_writer();
     server.handle_server_event(ServerEvent::ClientShellConnected {
+        auth: None,
         client_id: 78,
         surface_cols: 80,
         surface_rows: 24,
@@ -820,6 +829,7 @@ async fn client_shell_endpoint_request_uses_the_selected_connection() {
     let client_id = 41;
     assert!(
         server.handle_server_event(ServerEvent::ClientShellConnected {
+            auth: None,
             surface_reuse: false,
             surface_delta: false,
             surface_scroll: false,
@@ -908,6 +918,7 @@ fn terminal_client_endpoint_request_error_removes_client() {
     let (writer, _control_rx, _render_rx) = test_client_writer();
     let client_id = 42;
     assert!(!server.handle_server_event(ServerEvent::ClientConnected {
+        auth: None,
         client_id,
         cols: 80,
         rows: 24,
@@ -939,6 +950,7 @@ async fn client_shell_pairs_agent_view_set_replacement_and_clear_with_snapshots(
     let (writer, control_rx, _render_rx) = test_client_writer();
     assert!(
         server.handle_server_event(ServerEvent::ClientShellConnected {
+            auth: None,
             surface_reuse: false,
             surface_delta: false,
             surface_scroll: false,
@@ -1042,6 +1054,7 @@ async fn client_shell_receives_metadata_then_shell_free_pane_surface() {
     let (writer, control_rx, render_rx) = test_client_writer();
     assert!(
         server.handle_server_event(ServerEvent::ClientShellConnected {
+            auth: None,
             surface_reuse: false,
             surface_delta: false,
             surface_scroll: false,
@@ -1210,6 +1223,7 @@ fn connect_test_shell(
     let (writer, control, render) = test_client_writer();
     assert!(
         server.handle_server_event(ServerEvent::ClientShellConnected {
+            auth: None,
             surface_reuse: false,
             surface_delta: false,
             surface_scroll: false,
@@ -1815,6 +1829,7 @@ async fn client_shell_config_diagnostics_follow_keybinding_ownership() {
     let (local_writer, local_control, _local_render) = test_client_writer();
     assert!(
         server.handle_server_event(ServerEvent::ClientShellConnected {
+            auth: None,
             surface_reuse: false,
             surface_delta: false,
             surface_scroll: false,
@@ -1840,6 +1855,7 @@ async fn client_shell_config_diagnostics_follow_keybinding_ownership() {
     let (endpoint_writer, endpoint_control, _endpoint_render) = test_client_writer();
     assert!(
         server.handle_server_event(ServerEvent::ClientShellConnected {
+            auth: None,
             surface_reuse: false,
             surface_delta: false,
             surface_scroll: false,
@@ -2112,6 +2128,8 @@ async fn client_local_navigation_does_not_emit_global_focus_transitions() {
     server.handle_client_shell_api_request(
         62,
         crate::api::ApiRequestMessage {
+            native_shared: None,
+            native_client_id: None,
             request: crate::api::schema::Request {
                 id: "focus-own-tab".into(),
                 method: crate::api::schema::Method::TabFocus(crate::api::schema::TabTarget {
@@ -2205,6 +2223,8 @@ async fn client_local_navigation_emits_pane_focused_only_when_that_client_moves(
         server.handle_client_shell_api_request(
             client_id,
             api::ApiRequestMessage {
+                native_shared: None,
+                native_client_id: None,
                 request: api::schema::Request {
                     id: "navigate".into(),
                     method,
@@ -2330,6 +2350,8 @@ async fn repeated_layout_action_reapplies_controller_geometry() {
     assert!(server.handle_client_shell_api_request(
         65,
         crate::api::ApiRequestMessage {
+            native_shared: None,
+            native_client_id: None,
             request: crate::api::schema::Request {
                 id: "resize-layout".into(),
                 method: crate::api::schema::Method::LayoutSetSplitRatio(
@@ -2380,6 +2402,8 @@ async fn public_close_reapplies_controller_geometry() {
     let (respond_to, _response_rx) = std::sync::mpsc::channel();
     assert!(
         server.handle_api_request_with_shutdown_check(crate::api::ApiRequestMessage {
+            native_shared: None,
+            native_client_id: None,
             request: crate::api::schema::Request {
                 id: "public-close-geometry".into(),
                 method: crate::api::schema::Method::PaneClose(crate::api::schema::PaneTarget {
@@ -2580,6 +2604,8 @@ async fn public_background_tab_create_preserves_client_locations() {
 
     let (respond_to, _response_rx) = std::sync::mpsc::channel();
     server.handle_api_request_with_shutdown_check(crate::api::ApiRequestMessage {
+        native_shared: None,
+        native_client_id: None,
         request: crate::api::schema::Request {
             id: "create-background-tab".into(),
             method: crate::api::schema::Method::TabCreate(crate::api::schema::TabCreateParams {
@@ -2630,6 +2656,8 @@ async fn public_workspace_focus_preserves_each_clients_remembered_tabs() {
 
     let (respond_to, _response_rx) = std::sync::mpsc::channel();
     server.handle_api_request_with_shutdown_check(crate::api::ApiRequestMessage {
+        native_shared: None,
+        native_client_id: None,
         request: crate::api::schema::Request {
             id: "focus-second-workspace".into(),
             method: crate::api::schema::Method::WorkspaceFocus(
@@ -2713,6 +2741,8 @@ async fn public_agent_focus_replaces_a_diverged_client_shell_projection() {
         .unwrap();
     let (respond_to, response_rx) = std::sync::mpsc::channel();
     server.handle_api_request_with_shutdown_check(crate::api::ApiRequestMessage {
+        native_shared: None,
+        native_client_id: None,
         request: crate::api::schema::Request {
             id: "focus-first-agent".into(),
             method: crate::api::schema::Method::AgentFocus(crate::api::schema::AgentTarget {
@@ -2767,6 +2797,7 @@ async fn public_api_focus_replaces_every_client_shell_projection() {
     let (writer, control_rx, render_rx) = test_client_writer();
     assert!(
         server.handle_server_event(ServerEvent::ClientShellConnected {
+            auth: None,
             surface_reuse: false,
             surface_delta: false,
             surface_scroll: false,
@@ -2787,6 +2818,8 @@ async fn public_api_focus_replaces_every_client_shell_projection() {
 
     let (respond_to, _response_rx) = std::sync::mpsc::channel();
     server.handle_api_request_with_shutdown_check(crate::api::ApiRequestMessage {
+        native_shared: None,
+        native_client_id: None,
         request: crate::api::schema::Request {
             id: "test.client.shell.workspace.focus".into(),
             method: crate::api::schema::Method::WorkspaceFocus(
@@ -3015,6 +3048,7 @@ async fn client_shell_streams_and_targets_popup_terminal_content() {
     let (writer, control_rx, render_rx) = test_client_writer();
     assert!(
         server.handle_server_event(ServerEvent::ClientShellConnected {
+            auth: None,
             surface_reuse: false,
             surface_delta: false,
             surface_scroll: false,
@@ -3409,6 +3443,8 @@ async fn worktree_discovery_does_not_block_client_typing() {
         let (entered, release) = crate::worktree::test_list_gate::block(&repo);
         let (respond_to, response_rx) = std::sync::mpsc::channel();
         server.handle_api_request_with_shutdown_check(api::ApiRequestMessage {
+            native_shared: None,
+            native_client_id: None,
             request: api::schema::Request {
                 id: "blocked-read".into(),
                 method,
@@ -4036,6 +4072,7 @@ fn terminal_clients_store_known_cell_geometry_independently_of_pixel_mouse() {
 
     let (writer, _control_rx, _render_rx) = test_client_writer();
     assert!(!server.handle_server_event(ServerEvent::ClientConnected {
+        auth: None,
         client_id: 7,
         cols: 80,
         rows: 24,
@@ -4052,6 +4089,7 @@ fn terminal_clients_store_known_cell_geometry_independently_of_pixel_mouse() {
 
     let (writer, _control_rx, _render_rx) = test_client_writer();
     assert!(!server.handle_server_event(ServerEvent::ClientConnected {
+        auth: None,
         client_id: 8,
         cols: 80,
         rows: 24,
@@ -4076,6 +4114,7 @@ fn terminal_attach_rejects_missing_terminal_and_removes_client() {
     let (writer, control_rx, _render_rx) = test_client_writer();
 
     assert!(!server.handle_server_event(ServerEvent::ClientConnected {
+        auth: None,
         client_id: 7,
         cols: 80,
         rows: 24,
@@ -4138,6 +4177,7 @@ fn terminal_observers_wait_for_synchronized_output_with_or_without_baseline() {
         let connect = |server: &mut HeadlessServer, client_id| {
             let (writer, _control, render) = test_client_writer();
             assert!(!server.handle_server_event(ServerEvent::ClientConnected {
+                auth: None,
                 client_id,
                 cols: 80,
                 rows: 24,
@@ -4196,6 +4236,7 @@ fn connect_pending_terminal_client_with_control_rx(
 ) -> std::sync::mpsc::Receiver<Vec<u8>> {
     let (writer, control_rx, _render_rx) = test_client_writer();
     assert!(!server.handle_server_event(ServerEvent::ClientConnected {
+        auth: None,
         client_id,
         cols: 100,
         rows: 30,
@@ -4367,6 +4408,7 @@ fn backpressured_observer_skips_runtime_access_and_recovers_without_new_output()
     with_terminal_session_test_server(|server, terminal_id, target, _| {
         let (writer, control, frames) = test_client_writer();
         server.handle_server_event(ServerEvent::ClientConnected {
+            auth: None,
             client_id: 7,
             cols: 80,
             rows: 24,
@@ -5025,6 +5067,8 @@ fn windows_shutdown_probe_preserves_panes_and_agent_sessions() {
                 server.app.event_tx.try_send(death()).unwrap();
                 let (respond_to, response_rx) = std::sync::mpsc::channel();
                 server.handle_api_request_with_shutdown_check(api::ApiRequestMessage {
+                    native_shared: None,
+                    native_client_id: None,
                     request: api::schema::Request {
                         id: "shutdown-race".into(),
                         method: api::schema::Method::WorkspaceRename(
@@ -5261,6 +5305,7 @@ fn terminal_attach_client_exits_when_worktree_runtime_restore_fails() {
     let (writer, control_rx, _render_rx) = test_client_writer();
 
     assert!(!server.handle_server_event(ServerEvent::ClientConnected {
+        auth: None,
         client_id: 7,
         cols: 80,
         rows: 24,
@@ -5336,6 +5381,7 @@ fn terminal_attach_client_exits_when_worktree_remove_succeeds() {
     let (writer, control_rx, _render_rx) = test_client_writer();
 
     assert!(!server.handle_server_event(ServerEvent::ClientConnected {
+        auth: None,
         client_id: 7,
         cols: 80,
         rows: 24,
@@ -6469,6 +6515,7 @@ async fn client_shell_requests_host_pixels_for_an_unfocused_pixel_pane() {
     let (writer, control_rx, _render_rx) = test_client_writer();
     assert!(
         server.handle_server_event(ServerEvent::ClientShellConnected {
+            auth: None,
             surface_reuse: false,
             surface_delta: false,
             surface_scroll: false,
@@ -7543,6 +7590,8 @@ fn notification_show_api_forwards_one_semantic_client_notification() {
 
     let (respond_to, response_rx) = std::sync::mpsc::channel();
     let changed = server.handle_api_request_with_shutdown_check(api::ApiRequestMessage {
+        native_shared: None,
+        native_client_id: None,
         request: api::schema::Request {
             id: "notify".into(),
             method: api::schema::Method::NotificationShow(api::schema::NotificationShowParams {
@@ -7606,6 +7655,8 @@ fn notification_show_api_preserves_colon_in_forwarded_title() {
 
     let (respond_to, response_rx) = std::sync::mpsc::channel();
     let changed = server.handle_api_request_with_shutdown_check(api::ApiRequestMessage {
+        native_shared: None,
+        native_client_id: None,
         request: api::schema::Request {
             id: "notify".into(),
             method: api::schema::Method::NotificationShow(api::schema::NotificationShowParams {
@@ -7652,6 +7703,8 @@ fn notification_show_api_validates_empty_title_before_disabled_delivery() {
 
     let (respond_to, response_rx) = std::sync::mpsc::channel();
     let changed = server.handle_api_request_with_shutdown_check(api::ApiRequestMessage {
+        native_shared: None,
+        native_client_id: None,
         request: api::schema::Request {
             id: "notify".into(),
             method: api::schema::Method::NotificationShow(api::schema::NotificationShowParams {
@@ -7683,6 +7736,8 @@ fn notification_show_api_reports_no_foreground_client() {
 
     let (respond_to, response_rx) = std::sync::mpsc::channel();
     let changed = server.handle_api_request_with_shutdown_check(api::ApiRequestMessage {
+        native_shared: None,
+        native_client_id: None,
         request: api::schema::Request {
             id: "notify".into(),
             method: api::schema::Method::NotificationShow(api::schema::NotificationShowParams {
@@ -7732,6 +7787,8 @@ fn notification_show_api_includes_sound_in_semantic_event() {
     let (respond_to, response_rx) = std::sync::mpsc::channel();
     assert!(
         server.handle_api_request_with_shutdown_check(api::ApiRequestMessage {
+            native_shared: None,
+            native_client_id: None,
             request: api::schema::Request {
                 id: "notify".into(),
                 method: api::schema::Method::NotificationShow(
@@ -7801,6 +7858,8 @@ fn completion_guard_server(writer: ClientWriter) -> (HeadlessServer, crate::layo
 fn completion_guard_api_report(server: &mut HeadlessServer, method: api::schema::Method) {
     let (respond_to, response_rx) = std::sync::mpsc::channel();
     server.handle_api_request_with_shutdown_check(api::ApiRequestMessage {
+        native_shared: None,
+        native_client_id: None,
         request: api::schema::Request {
             id: "completion-probe".into(),
             method,
@@ -7861,6 +7920,8 @@ fn api_report_agent_stores_valid_resume_argv_and_rejects_invalid() {
 
     let (respond_to, response_rx) = std::sync::mpsc::channel();
     server.handle_api_request_with_shutdown_check(api::ApiRequestMessage {
+        native_shared: None,
+        native_client_id: None,
         request: api::schema::Request {
             id: "invalid-resume".into(),
             method: report(vec!["/opt/prime/prime-agent", "--resume", "01a0"]),
@@ -7883,6 +7944,8 @@ fn api_report_agent_stores_valid_resume_argv_and_rejects_invalid() {
 
     let (respond_to, response_rx) = std::sync::mpsc::channel();
     server.handle_api_request_with_shutdown_check(api::ApiRequestMessage {
+        native_shared: None,
+        native_client_id: None,
         request: api::schema::Request {
             id: "not-owner".into(),
             method: api::schema::Method::PaneReportAgentSession(
@@ -8268,6 +8331,8 @@ fn stale_api_agent_report_does_not_forward_done_sound() {
 
     let (respond_to, response_rx) = std::sync::mpsc::channel();
     let changed = server.handle_api_request_with_shutdown_check(api::ApiRequestMessage {
+        native_shared: None,
+        native_client_id: None,
         request: api::schema::Request {
             id: "stale".into(),
             method: api::schema::Method::PaneReportAgent(api::schema::PaneReportAgentParams {

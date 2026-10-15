@@ -4,6 +4,7 @@ use super::*;
 pub(super) enum ClientGlobalMenuAction {
     Binding(crate::input::KeybindAction),
     WhatsNew,
+    SpaceAccess,
 }
 
 pub(super) fn global_menu_attention(snapshot: &ClientShellSnapshot) -> bool {
@@ -53,12 +54,34 @@ pub(super) fn global_menu_items(
     items
 }
 
+pub(super) fn global_menu_items_with_access(
+    snapshot: &ClientShellSnapshot,
+    space_access: bool,
+) -> Vec<(&'static str, ClientGlobalMenuAction)> {
+    let mut items = global_menu_items(snapshot);
+    if space_access {
+        items.insert(1, ("Space access", ClientGlobalMenuAction::SpaceAccess));
+    }
+    items
+}
+
 impl ClientShellState {
+    pub(crate) fn enable_owner_space_access(&mut self) {
+        self.owner_space_access = true;
+    }
+
+    pub(crate) fn owner_space_access_available(&self) -> bool {
+        self.owner_space_access
+            && self.active_endpoint_id.is_local()
+            && self.shared_access.is_none()
+    }
+
     pub(super) fn toggle_global_menu(&mut self) {
         if matches!(self.overlay, Some(ClientShellOverlay::GlobalMenu(_))) {
             self.overlay = None;
         } else {
             self.overlay = Some(ClientShellOverlay::GlobalMenu(ClientGlobalMenuOverlay {
+                space_access: self.owner_space_access_available(),
                 highlighted: 0,
             }));
         }
@@ -68,7 +91,9 @@ impl ClientShellState {
         let item_count = self
             .snapshot
             .as_deref()
-            .map(global_menu_items)
+            .map(|snapshot| {
+                global_menu_items_with_access(snapshot, self.owner_space_access_available())
+            })
             .map_or(0, |items| items.len());
         let Some(ClientShellOverlay::GlobalMenu(menu)) = self.overlay.as_mut() else {
             return;
@@ -83,7 +108,7 @@ impl ClientShellState {
         outcome: &mut ClientShellInput,
     ) {
         let Some(action) = self.snapshot.as_deref().and_then(|snapshot| {
-            global_menu_items(snapshot)
+            global_menu_items_with_access(snapshot, self.owner_space_access_available())
                 .get(index)
                 .map(|(_, action)| *action)
         }) else {
@@ -104,6 +129,9 @@ impl ClientShellState {
                 self.record_binding(crate::input::KeybindMatch::Action(binding), outcome)
             }
             ClientGlobalMenuAction::WhatsNew => self.open_release_notes(),
+            ClientGlobalMenuAction::SpaceAccess => {
+                outcome.actions.push(ClientShellAction::OwnerSpaceAccess)
+            }
         }
         outcome.repaint = true;
     }

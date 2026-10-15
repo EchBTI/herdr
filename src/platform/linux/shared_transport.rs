@@ -149,6 +149,33 @@ pub(crate) fn bind_listener(path: &Path, gid: u32) -> io::Result<Listener> {
     Ok(Listener(listener))
 }
 
+/// Bind the native Herdr endpoint inside the same pinned, owner-controlled directory.
+pub(crate) fn bind_native_listener(path: &Path, gid: u32) -> io::Result<crate::ipc::LocalListener> {
+    use interprocess::local_socket::traits::Listener as _;
+    let (directory, name) = socket_directory(path, Some(gid))?;
+    let listener = crate::ipc::bind_local_listener(&anchored_path(&directory, &name))?;
+    // SAFETY: our pinned directory is writable only by the session owner.
+    if unsafe {
+        libc::fchownat(
+            directory.as_raw_fd(),
+            name.as_ptr(),
+            crate::platform::effective_uid()?,
+            gid,
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    } != 0
+        || unsafe { libc::fchmodat(directory.as_raw_fd(), name.as_ptr(), 0o660, 0) } != 0
+    {
+        let error = io::Error::last_os_error();
+        unsafe {
+            libc::unlinkat(directory.as_raw_fd(), name.as_ptr(), 0);
+        }
+        return Err(error);
+    }
+    listener.set_nonblocking(interprocess::local_socket::ListenerNonblockingMode::Both)?;
+    Ok(listener)
+}
+
 pub(crate) fn remove_socket(path: &Path) -> io::Result<()> {
     let (directory, name) = socket_directory(path, None)?;
     let metadata = match std::fs::symlink_metadata(anchored_path(&directory, &name)) {
@@ -255,20 +282,43 @@ mod tests {
     }
 
     #[test]
+    fn native_endpoint_preserves_group_boundary_and_kernel_identity() {
+        use interprocess::local_socket::traits::Listener as _;
+        let temp = Temp::new();
+        let path = temp.0.join("native/client.sock");
+        let listener = bind_native_listener(&path, gid()).unwrap();
+        assert_eq!(std::fs::metadata(&path).unwrap().mode() & 0o7777, 0o660);
+        assert_eq!(std::fs::metadata(&path).unwrap().gid(), gid());
+        let _client = crate::ipc::connect_local_stream(&path).unwrap();
+        let server = listener.accept().unwrap();
+        assert_eq!(
+            crate::platform::local_stream_peer_identity(&server)
+                .unwrap()
+                .uid,
+            crate::platform::effective_uid().unwrap()
+        );
+        assert!(bind_native_listener(&path, gid()).is_err());
+        remove_socket(&path).unwrap();
+    }
+
+    #[test]
     fn rejects_symlinks_and_insecure_existing_directories() {
         let temp = Temp::new();
         let shared = temp.0.join("shared");
         std::fs::create_dir(&shared).unwrap();
         std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o777)).unwrap();
         assert!(bind_listener(&shared.join("session.sock"), gid()).is_err());
+        assert!(bind_native_listener(&shared.join("session.sock"), gid()).is_err());
         let linked = temp.0.join("linked");
         symlink(&shared, &linked).unwrap();
         assert!(bind_listener(&linked.join("session.sock"), gid()).is_err());
+        assert!(bind_native_listener(&linked.join("session.sock"), gid()).is_err());
         std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o750)).unwrap();
         let target = temp.0.join("private");
         std::fs::write(&target, "keep me").unwrap();
         symlink(&target, shared.join("session.sock")).unwrap();
         assert!(bind_listener(&shared.join("session.sock"), gid()).is_err());
+        assert!(bind_native_listener(&shared.join("session.sock"), gid()).is_err());
         assert!(remove_socket(&shared.join("session.sock")).is_err());
         assert_eq!(std::fs::read_to_string(target).unwrap(), "keep me");
     }

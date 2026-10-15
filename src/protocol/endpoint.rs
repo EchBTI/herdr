@@ -13,6 +13,7 @@ use serde::{Deserialize, Serialize};
 use super::{ClientShellSnapshot, ClientSurfaceSize, ServerMessage};
 
 pub const ENDPOINT_PROTOCOL_GENERATION: u32 = 1;
+pub const SHARED_ACCESS_CAPABILITY: &str = "shared_access.v1";
 pub const ENDPOINT_HELLO_KIND: &str = "endpoint.hello.v1";
 pub const ENDPOINT_WELCOME_KIND: &str = "endpoint.welcome.v1";
 pub const SNAPSHOT_CODEC_V1: &str = "shell.snapshot.v1";
@@ -45,6 +46,9 @@ fn default_true() -> bool {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EndpointClientHello {
+    /// Explicitly negotiate OS-account shared-session authorization.
+    #[serde(default)]
+    pub shared_access: bool,
     pub generation: u32,
     pub cell_width_px: u32,
     pub cell_height_px: u32,
@@ -203,6 +207,7 @@ mod tests {
 
     fn hello() -> EndpointClientHello {
         EndpointClientHello {
+            shared_access: false,
             generation: ENDPOINT_PROTOCOL_GENERATION,
             cell_width_px: 8,
             cell_height_px: 16,
@@ -248,6 +253,14 @@ mod tests {
             agents: Vec::new(),
             commands: Vec::new(),
         }
+    }
+
+    #[test]
+    fn old_endpoint_hello_does_not_negotiate_shared_access() {
+        let mut value = serde_json::to_value(hello()).unwrap();
+        value.as_object_mut().unwrap().remove("shared_access");
+        let decoded: EndpointClientHello = serde_json::from_value(value).unwrap();
+        assert!(!decoded.shared_access);
     }
 
     #[test]

@@ -2,18 +2,13 @@
 
 ## Decision
 
-The first executable slice uses an explicit Linux shared-access broker and a new
-shared-session frontend. Existing private JSON and native TUI endpoints retain
-their owner-only permissions and protocol. The shared broker authenticates the
-kernel peer UID, reads an owner-only policy, resolves public object IDs through
-the private server's authoritative snapshot, and exposes a deliberately narrow,
-default-deny JSON method set. It never forwards arbitrary client requests.
+The initial broker implementation has been extended with a negotiated native shared endpoint. Participants now use the existing Herdr renderer and event loop. The JSON broker remains the owner administration/scripting surface, and the old text frontend requires `--text`. Private JSON/native sockets remain owner-only.
 
-This is a bounded implementation of trusted collaboration. It does not complete
-native TUI shared attachment, direct-terminal shared attachment, native SSH/Cloud
-sharing, or the entire PRD. Those remain release gates before claiming native
-per-space access support. A controlling participant executes with the account
-running the terminal. Separate login accounts do not isolate terminal execution.
+Native connections retain kernel-authenticated principals; the server scopes snapshots, completions, surfaces, assets and input. A defaulted JSON hello flag negotiates `shared_access.v1` without changing the frozen bincode graph. Policy changes synchronously revoke native writers and remove connections before acknowledgement. View workspace/tab navigation and reads are presentation-local; terminal and layout mutation requires Control. The owner menu opens administration with live native connection counts.
+
+This is trusted collaboration: Control executes as the terminal owner. Durable grants across full runtime restart, broader lifecycle/audit coverage, native remote bridges and isolated workers remain separate work. Legacy direct terminal and global owner operations fail closed for participants.
+
+The inventory below records the design constraints and conservative method classification used by the implementation. Not every classified read/control method is advertised through the native client lane; unsupported methods remain denied.
 
 Use a separate explicitly selected group socket in an owner-controlled directory.
 Directory ownership, modes and symlinks must be checked; parent traversal and
@@ -41,7 +36,7 @@ The matrix below also inventories the full native implementation for subsequent
 work. An operation's current `changes_ui` or `client_shell` flag is not an access
 classification: e.g. `pane.send_text` changes runtime despite `changes_ui=false`.
 
-## Native integration path after the broker
+## Native integration contracts
 
 `src/platform/mod.rs` defines a neutral peer-identity contract; Linux implements
 `SO_PEERCRED` in `src/platform/linux.rs`. The existing `socket_peer_pid` reads the
@@ -64,10 +59,9 @@ projection, tab-bar strings, diagnostic/config fields, worktree paths and
 notifications. Filtering only workspace arrays leaks data. Do not mutate
 AppState or renumber authoritative IDs to produce a client projection.
 
-`headless/client_views.rs::shell_target_for_client` currently falls back to
-`default_shell_target`, and `reconcile_client_shell_locations` uses one global
-topology including first-workspace fallback. Both need per-principal topology
-before render or geometry selection. No accessible workspace means no target,
+`headless/client_views.rs::shell_target_for_client` and
+`reconcile_client_shell_locations` now resolve per-principal topology and allowed
+focus fallback before rendering or selecting geometry. No accessible workspace means no target,
 an empty projection, and no automatic workspace creation.
 
 `headless/render.rs::render_and_stream_with_graphics_limit` must check the

@@ -801,7 +801,67 @@ pub(super) fn write_host_keyboard_protocol_refresh(
     writer.flush()
 }
 
+/// Always resume the native terminal, including when the borrowed screen fails.
+#[cfg(any(unix, test))]
+fn run_borrowed_screen(
+    suspend: impl FnOnce() -> io::Result<()>,
+    screen: impl FnOnce() -> io::Result<()>,
+    resume: impl FnOnce() -> io::Result<()>,
+) -> io::Result<io::Result<()>> {
+    let result = suspend().and_then(|()| screen());
+    resume()?;
+    Ok(result)
+}
+
 impl TerminalGuard {
+    #[cfg(unix)]
+    pub(super) fn with_owner_admin_screen(
+        &self,
+        mouse_capture: bool,
+        sgr_pixels: bool,
+        report_all_keys: bool,
+        screen: impl FnOnce() -> io::Result<()>,
+    ) -> io::Result<io::Result<()>> {
+        use crossterm::terminal::{
+            disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
+        };
+        run_borrowed_screen(
+            || {
+                if self.reset_keyboard_enhancements {
+                    pop_keyboard_enhancement_flags()?;
+                }
+                if self.reset_modify_other_keys {
+                    io::stdout().write_all(b"\x1b[>4;0m")?;
+                }
+                if self.reset_host_color_scheme_reports {
+                    write_host_color_scheme_report_mode(&mut io::stdout(), false)?;
+                }
+                set_mouse_capture(false, false)?;
+                execute!(
+                    io::stdout(),
+                    DisableFocusChange,
+                    DisableBracketedPaste,
+                    EnableLineWrap,
+                    LeaveAlternateScreen
+                )?;
+                disable_raw_mode()
+            },
+            screen,
+            || {
+                enable_raw_mode()?;
+                execute!(io::stdout(), EnterAlternateScreen, DisableLineWrap)?;
+                if self.reset_keyboard_enhancements {
+                    push_keyboard_enhancement_flags()?;
+                }
+                self.refresh_host_keyboard_protocol(&mut io::stdout(), report_all_keys, true)?;
+                if self.reset_host_color_scheme_reports {
+                    write_host_color_scheme_report_mode(&mut io::stdout(), true)?;
+                }
+                set_mouse_capture(mouse_capture, sgr_pixels)
+            },
+        )
+    }
+
     pub(super) fn host_escape_disambiguation_active(&self) -> bool {
         self.host_escape_disambiguation_active
     }
@@ -1277,5 +1337,50 @@ mod tests {
             output,
             b"\x1b[?1006l\x1b[?1016l\x1b[?1015l\x1b[?1005l\x1b[?1003l\x1b[?1002l\x1b[?1000l\x1b[?9l"
         );
+    }
+}
+
+#[cfg(test)]
+mod borrowed_screen_tests {
+    use super::*;
+    #[test]
+    fn owner_admin_restores_terminal_after_screen_or_setup_failure() {
+        for setup_succeeds in [false, true] {
+            let calls = std::cell::RefCell::new(Vec::new());
+            let result = run_borrowed_screen(
+                || {
+                    calls.borrow_mut().push("suspend");
+                    if setup_succeeds {
+                        Ok(())
+                    } else {
+                        Err(io::Error::other("suspend failed"))
+                    }
+                },
+                || {
+                    calls.borrow_mut().push("screen");
+                    Err(io::Error::other("sharing unavailable"))
+                },
+                || {
+                    calls.borrow_mut().push("resume");
+                    Ok(())
+                },
+            );
+            assert!(result.unwrap().is_err());
+            let expected = if setup_succeeds {
+                vec!["suspend", "screen", "resume"]
+            } else {
+                vec!["suspend", "resume"]
+            };
+            assert_eq!(*calls.borrow(), expected);
+        }
+    }
+    #[test]
+    fn owner_admin_does_not_hide_terminal_resume_failure() {
+        let result = run_borrowed_screen(
+            || Ok(()),
+            || Ok(()),
+            || Err(io::Error::other("resume failed")),
+        );
+        assert_eq!(result.unwrap_err().to_string(), "resume failed");
     }
 }

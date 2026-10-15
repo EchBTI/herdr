@@ -26,6 +26,9 @@ mod unsupported {
     pub(crate) fn bind_listener(_: &Path, _: u32) -> io::Result<Listener> {
         unsupported()
     }
+    pub(crate) fn bind_native_listener(_: &Path, _: u32) -> io::Result<crate::ipc::LocalListener> {
+        unsupported()
+    }
     pub(crate) fn remove_socket(_: &Path) -> io::Result<()> {
         unsupported()
     }

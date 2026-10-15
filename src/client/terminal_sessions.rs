@@ -105,6 +105,7 @@ fn connect_terminal_session_stream(
         false,
         true,
         true,
+        false,
         &AtomicBool::new(false),
     ) {
         Ok(handshake) if handshake.encoding == RenderEncoding::TerminalAnsi => {}

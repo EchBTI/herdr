@@ -1,6 +1,6 @@
 # Shared-space implementation planning
 
-This fork uses Beads (`bd`) for work tracking. The PRD is at [.local/prd/os-user-space-access.md](../.local/prd/os-user-space-access.md). That file is deliberately force-tracked for this requested fork deliverable; upstream normally keeps `.local/` planning files ignored. The fork now includes a restricted Linux shared-access preview. Published release snapshots and frozen protocol codecs are unchanged.
+This fork uses Beads (`bd`) for work tracking. The PRD is at [.local/prd/os-user-space-access.md](../.local/prd/os-user-space-access.md). That file is deliberately force-tracked for this requested fork deliverable; upstream normally keeps `.local/` planning files ignored. The fork now includes a Linux shared access with the normal native client. Published release snapshots and frozen protocol codecs are unchanged.
 
 ## Start work
 
@@ -38,4 +38,4 @@ Commit the refreshed snapshot alongside related source/specification changes and
 
 ## Validation of this planning delivery
 
-The initial planning-only delivery was followed by a working Linux preview. Source baseline: `916fcf8de029c6cac965b50f3cdb9687cd7d1537`. Read `docs/next/shared-access.md` for setup and limitations and `.local/prd/os-user-space-access-validation.md` for measured qualification. The full native-client PRD and isolated execution epic remain open. The preview deliberately requires new grants after a native server restart; do not weaken that boundary before durable workspace incarnations are implemented.
+The initial planning-only delivery was followed by a working Linux preview. Source baseline: `916fcf8de029c6cac965b50f3cdb9687cd7d1537`. Read `docs/next/shared-access.md` for setup and limitations and `.local/prd/os-user-space-access-validation.md` for measured qualification. Native transport, filtering, input checks, owner menu administration and connected-user indicators are implemented. Durable workspace incarnations and isolated execution remain open. The preview deliberately requires new grants after a native server restart; do not weaken that boundary before durable workspace incarnations are implemented.

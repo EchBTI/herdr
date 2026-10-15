@@ -127,6 +127,22 @@ pub(crate) struct ClientWriter {
 }
 
 impl ClientWriter {
+    /// Revoke access, discarding all pending data and aborting socket writes.
+    pub(crate) fn revoke(&self) {
+        self.render.queue.close_writer();
+        #[cfg(unix)]
+        if let Some(stream) = self
+            .render
+            .queue
+            .shutdown_stream
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+        {
+            let _ = crate::platform::shutdown_client_stream(stream);
+        }
+    }
+
     /// Drops render-lane work that has not yet been claimed by the writer.
     pub(crate) fn discard_pending_render(&self) {
         self.render.queue.discard_pending_render();
@@ -266,6 +282,8 @@ impl ClientRenderWriter {
 
 #[derive(Debug)]
 struct ClientWriterQueue {
+    #[cfg(unix)]
+    shutdown_stream: Mutex<Option<LocalStream>>,
     state: Mutex<ClientWriterQueueState>,
     ready: Condvar,
 }
@@ -288,6 +306,8 @@ enum ClientWriteItem {
 impl ClientWriterQueue {
     fn new() -> Arc<Self> {
         Arc::new(Self {
+            #[cfg(unix)]
+            shutdown_stream: Mutex::new(None),
             state: Mutex::new(ClientWriterQueueState {
                 writer_alive: true,
                 ..ClientWriterQueueState::default()
@@ -356,6 +376,9 @@ impl ClientWriterQueue {
     fn recv(&self) -> Option<ClientWriteItem> {
         let mut state = self.lock_state();
         loop {
+            if !state.writer_alive {
+                return None;
+            }
             if let Some(data) = state.control.pop_front() {
                 return Some(ClientWriteItem::Control(data));
             }
@@ -379,6 +402,7 @@ impl ClientWriterQueue {
     fn close_writer(&self) {
         let mut state = self.lock_state();
         state.writer_alive = false;
+        state.control.clear();
         state.render = None;
         state.ordered.clear();
         self.ready.notify_all();
@@ -396,6 +420,7 @@ impl ClientWriterQueue {
 pub(crate) enum ServerEvent {
     /// A new client completed the handshake.
     ClientConnected {
+        auth: Option<crate::shared::native_transport::NativePrincipal>,
         client_id: u64,
         cols: u16,
         rows: u16,
@@ -406,6 +431,7 @@ pub(crate) enum ServerEvent {
     },
     /// A client-owned shell completed its dedicated handshake.
     ClientShellConnected {
+        auth: Option<crate::shared::native_transport::NativePrincipal>,
         client_id: u64,
         surface_cols: u16,
         surface_rows: u16,
@@ -668,10 +694,20 @@ fn set_client_recv_timeout(
 /// Reads the `TerminalHello` or `ClientShellHello` message, validates the version,
 /// sends `Welcome`, and then enters a read loop forwarding messages to the server event channel.
 pub(crate) fn handle_client_handshake(
+    stream: LocalStream,
+    client_id: u64,
+    server_event_tx: &mpsc::Sender<ServerEvent>,
+    should_quit: &Arc<AtomicBool>,
+) -> io::Result<()> {
+    handle_client_handshake_with_auth(stream, client_id, server_event_tx, should_quit, None)
+}
+
+pub(crate) fn handle_client_handshake_with_auth(
     mut stream: LocalStream,
     client_id: u64,
     server_event_tx: &mpsc::Sender<ServerEvent>,
     should_quit: &Arc<AtomicBool>,
+    auth: Option<crate::shared::native_transport::NativePrincipal>,
 ) -> io::Result<()> {
     if should_quit.load(Ordering::Acquire) {
         return Ok(());
@@ -721,6 +757,14 @@ pub(crate) fn handle_client_handshake(
             cell_height_px,
             pixel_mouse,
         } => {
+            if auth.is_some() {
+                write_endpoint_rejection(
+                    &mut stream,
+                    "shared_endpoint_required",
+                    "shared connections require the native endpoint shared-access capability",
+                );
+                return Ok(());
+            }
             if let protocol::VersionCheck::Incompatible(reason) =
                 protocol::check_client_version(version)
             {
@@ -747,6 +791,14 @@ pub(crate) fn handle_client_handshake(
                     return Ok(());
                 }
             };
+            if auth.is_some() && !hello.shared_access {
+                write_endpoint_rejection(
+                    &mut stream,
+                    "shared_access_required",
+                    "client does not support shared OS-account permissions",
+                );
+                return Ok(());
+            }
             let incompatibility = if hello.generation != ENDPOINT_PROTOCOL_GENERATION {
                 Some((
                     "unsupported_generation",
@@ -780,7 +832,7 @@ pub(crate) fn handle_client_handshake(
                 false,
                 Some((
                     hello.pixel_mouse,
-                    hello.direct_graphics,
+                    hello.direct_graphics && auth.is_none(),
                     hello.endpoint_keybindings,
                     hello.mouse_capture,
                     hello.surface_active,
@@ -828,12 +880,17 @@ pub(crate) fn handle_client_handshake(
         RenderEncoding::TerminalAnsi
     };
     let welcome = if shell_options.is_some() {
-        let welcome = EndpointServerWelcome::compatible(
+        let mut welcome = EndpointServerWelcome::compatible(
             crate::server::client_commands::supported_client_shell_method_names()
                 .iter()
                 .map(|method| (*method).to_owned())
                 .collect(),
         );
+        if auth.is_some() {
+            welcome
+                .capabilities
+                .push(crate::protocol::endpoint::SHARED_ACCESS_CAPABILITY.into());
+        }
         ServerMessage::EndpointControl {
             kind: ENDPOINT_WELCOME_KIND.into(),
             data: serde_json::to_string(&welcome).map_err(io::Error::other)?,
@@ -856,6 +913,13 @@ pub(crate) fn handle_client_handshake(
 
     // Create separate channels for reliable control messages and droppable renders.
     let writer_queue = ClientWriterQueue::new();
+    #[cfg(unix)]
+    {
+        *writer_queue
+            .shutdown_stream
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(stream.try_clone()?);
+    }
     let writer = ClientWriter {
         control: ClientControlWriter::queue(writer_queue.clone()),
         render: ClientRenderWriter::queue(writer_queue.clone()),
@@ -887,6 +951,7 @@ pub(crate) fn handle_client_handshake(
     )) = shell_options
     {
         ServerEvent::ClientShellConnected {
+            auth,
             client_id,
             surface_cols: client_cols,
             surface_rows: client_rows,
@@ -904,6 +969,7 @@ pub(crate) fn handle_client_handshake(
         }
     } else {
         ServerEvent::ClientConnected {
+            auth,
             client_id,
             cols: client_cols,
             rows: client_rows,
@@ -1462,6 +1528,7 @@ mod tests {
 
     fn endpoint_hello(surface_cols: u16, surface_rows: u16) -> ClientMessage {
         let hello = EndpointClientHello {
+            shared_access: false,
             generation: ENDPOINT_PROTOCOL_GENERATION,
             cell_width_px: 8,
             cell_height_px: 16,
@@ -1924,6 +1991,122 @@ mod tests {
         ));
     }
 
+    fn test_shared_principal() -> crate::shared::native_transport::NativePrincipal {
+        crate::shared::native_transport::NativePrincipal {
+            caller: crate::access::Caller::verified(1001, Some("alice".into())),
+            policy_directory: "/unused".into(),
+            policy_revision: 7,
+            policy_host_id: "test-host:runtime".into(),
+        }
+    }
+
+    #[test]
+    fn shared_handshake_rejects_unnegotiated_endpoint_and_raw_terminal() {
+        for hello in [
+            endpoint_hello(80, 24),
+            ClientMessage::TerminalHello {
+                version: PROTOCOL_VERSION,
+                cols: 80,
+                rows: 24,
+                cell_width_px: 8,
+                cell_height_px: 16,
+                pixel_mouse: false,
+            },
+        ] {
+            let (mut client, server, _path) = local_stream_pair("shared-reject");
+            let (tx, mut rx) = mpsc::channel(4);
+            let thread = std::thread::spawn(move || {
+                handle_client_handshake_with_auth(
+                    server,
+                    7,
+                    &tx,
+                    &Arc::new(AtomicBool::new(false)),
+                    Some(test_shared_principal()),
+                )
+            });
+            protocol::write_message(&mut client, &hello).unwrap();
+            let welcome =
+                endpoint_welcome(protocol::read_message(&mut client, MAX_FRAME_SIZE).unwrap());
+            assert!(welcome.error.is_some());
+            thread.join().unwrap().unwrap();
+            assert!(rx.try_recv().is_err());
+        }
+    }
+
+    #[test]
+    fn shared_handshake_preserves_verified_identity_and_disables_file_graphics() {
+        let (mut client, server, _path) = local_stream_pair("shared-negotiate");
+        let (tx, mut rx) = mpsc::channel(4);
+        let thread = std::thread::spawn(move || {
+            handle_client_handshake_with_auth(
+                server,
+                8,
+                &tx,
+                &Arc::new(AtomicBool::new(false)),
+                Some(test_shared_principal()),
+            )
+        });
+        let ClientMessage::EndpointControl { kind, data } = endpoint_hello(80, 24) else {
+            unreachable!()
+        };
+        let mut hello: EndpointClientHello = serde_json::from_str(&data).unwrap();
+        hello.shared_access = true;
+        protocol::write_message(
+            &mut client,
+            &ClientMessage::EndpointControl {
+                kind,
+                data: serde_json::to_string(&hello).unwrap(),
+            },
+        )
+        .unwrap();
+        let welcome =
+            endpoint_welcome(protocol::read_message(&mut client, MAX_FRAME_SIZE).unwrap());
+        assert!(welcome.error.is_none());
+        assert!(welcome
+            .capabilities
+            .iter()
+            .any(|capability| capability == crate::protocol::endpoint::SHARED_ACCESS_CAPABILITY));
+        let ServerEvent::ClientShellConnected {
+            auth: Some(auth),
+            direct_graphics,
+            writer,
+            ..
+        } = rx.blocking_recv().unwrap()
+        else {
+            panic!("expected authenticated endpoint");
+        };
+        assert_eq!(auth.caller.uid(), 1001);
+        assert_eq!(auth.policy_revision, 7);
+        assert!(!direct_graphics);
+        writer.revoke();
+        drop(client);
+        thread.join().unwrap().unwrap();
+    }
+
+    #[test]
+    fn revoked_writer_discards_control_ordered_and_render_lanes() {
+        let (writer, queue) = test_queue_writer();
+        writer
+            .control
+            .send(b"confidential-control".to_vec())
+            .unwrap();
+        writer
+            .render
+            .try_send(b"confidential-render".to_vec())
+            .unwrap();
+        writer
+            .render
+            .send_ordered(b"confidential-ordered".to_vec())
+            .unwrap();
+        writer.revoke();
+        assert_eq!(queue.recv(), None);
+        assert!(writer.control.send(b"late".to_vec()).is_err());
+        assert!(matches!(
+            writer.render.try_send(b"late".to_vec()),
+            Err(TrySendError::Disconnected(_))
+        ));
+    }
+
     #[test]
     fn handshake_negotiates_terminal_ansi_encoding() {
         let (mut client_stream, server_stream, _path) = local_stream_pair("client-handshake-ansi");
@@ -1967,6 +2150,7 @@ mod tests {
             .expect("client connected event")
         {
             ServerEvent::ClientConnected {
+                auth,
                 client_id,
                 cols,
                 rows,
@@ -1975,6 +2159,7 @@ mod tests {
                 pixel_mouse,
                 writer,
             } => {
+                assert!(auth.is_none());
                 assert_eq!(client_id, 42);
                 assert_eq!((cols, rows), (100, 30));
                 assert_eq!((cell_width_px, cell_height_px), (8, 16));
@@ -2015,6 +2200,7 @@ mod tests {
             .expect("client shell connected event")
         {
             ServerEvent::ClientShellConnected {
+                auth,
                 client_id,
                 surface_cols,
                 surface_rows,
@@ -2033,6 +2219,7 @@ mod tests {
                 assert!(!surface_reuse);
                 assert!(!surface_delta);
                 assert!(!surface_scroll);
+                assert!(auth.is_none());
                 assert_eq!(client_id, 43);
                 assert_eq!((surface_cols, surface_rows), (80, 29));
                 assert_eq!((cell_width_px, cell_height_px), (8, 16));

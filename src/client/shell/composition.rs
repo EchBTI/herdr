@@ -152,6 +152,32 @@ impl ClientShellState {
         cols: u16,
         rows: u16,
     ) -> Option<crate::client::frame_output::ComposedFrame> {
+        if let Some(message) = self.shared_empty_message() {
+            self.hits = ShellHitMap::default();
+            let mut buffer = Buffer::empty(Rect::new(0, 0, cols, rows));
+            buffer.set_style(
+                buffer.area,
+                Style::default()
+                    .fg(self.config.palette.text)
+                    .bg(self.config.palette.panel_bg),
+            );
+            ratatui::widgets::Widget::render(
+                ratatui::widgets::Paragraph::new(message)
+                    .wrap(ratatui::widgets::Wrap { trim: true }),
+                Rect::new(1, 1, cols.saturating_sub(2), rows.saturating_sub(2)),
+                &mut buffer,
+            );
+            let mut frame: crate::client::frame_output::ComposedFrame =
+                FrameData::from_ratatui_buffer_with_hyperlinks(&buffer, None, &[]).into();
+            frame.graphics = self.graphics.encode_output(
+                crate::kitty_graphics::surface::Visibility::Hidden,
+                (0, 0),
+                None,
+                self.graphics_cell_size,
+                &crate::kitty_graphics::surface::Occlusion::default(),
+            );
+            return Some(frame);
+        }
         self.last_composed_at = Some(std::time::Instant::now());
         self.selection_repaint_deadline = None;
         if self.last_composed_size != Some((cols, rows)) && self.mode == ClientShellMode::Navigate {
@@ -610,6 +636,7 @@ impl ClientShellState {
                 self.navigate_workspace_id
                     .as_ref()
                     .filter(|_| valid_navigation_target),
+                self.owner_space_access_available(),
                 &mut self.mobile_switcher_scroll,
                 &mut self.reveal_mobile_workspace,
                 &mut self.hits,

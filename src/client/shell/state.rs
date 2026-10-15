@@ -254,6 +254,7 @@ pub(crate) enum ClientShellAction {
     },
     ReplayMouse(Vec<crossterm::event::MouseEvent>),
     Keybind(crate::input::KeybindAction),
+    OwnerSpaceAccess,
 }
 
 #[derive(Default)]
@@ -378,6 +379,7 @@ pub(super) struct ClientHelpOverlay {
 
 #[derive(Debug)]
 pub(super) struct ClientGlobalMenuOverlay {
+    pub(super) space_access: bool,
     pub(super) highlighted: usize,
 }
 
@@ -857,6 +859,8 @@ pub(super) struct ClientCopyModeState {
 }
 
 pub(crate) struct ClientShellState {
+    pub(super) owner_space_access: bool,
+    pub(super) shared_access: Option<super::shared_access::SharedAccess>,
     pub(super) machine_diagnostics: super::machine_diagnostics::MachineDiagnostics,
     pub(super) config: ClientShellConfig,
     pub(super) snapshot: Option<Box<ClientShellSnapshot>>,
@@ -1030,6 +1034,8 @@ impl ClientShellState {
                 .extend(saved.collapsed_groups);
         }
         Self {
+            owner_space_access: false,
+            shared_access: None,
             machine_diagnostics: Default::default(),
             config,
             snapshot: None,

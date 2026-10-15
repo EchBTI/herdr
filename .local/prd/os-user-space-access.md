@@ -1,6 +1,6 @@
 # OS-user access to shared Herdr spaces
 
-Status: trusted-collaboration preview implemented; full native-client PRD remains in progress
+Status: native shared-client implementation qualified on Linux; durable workspace restart identity remains in progress
 
 Date: 15 October 2026
 
@@ -148,16 +148,18 @@ See `.beads/PLANNING.md` for tracker recovery and sync instructions. No implemen
 
 ## Implementation conformance (15 October 2026)
 
-The fork now implements a separate Linux sharing broker, shared text frontend, owner access screen, and scoped owner-private native dispatch. This bounds the exposed surface while preserving existing owner-only sockets and all frozen protocol codecs.
+The fork now provides the normal native Herdr renderer and event loop through a negotiated Linux shared endpoint. The JSON broker remains the owner administration and scripting surface; the earlier polling screen is an explicit `--text` option. Existing private sockets and frozen protocol codecs retain their original contracts.
 
-Verified OS users receive only allowlisted metadata and terminal text for granted spaces. View cannot send input or mutate terminal geometry. Control can send keys/text and create panes; native checks bind the policy, account, runtime, workspace and terminal at execution. A cross-process policy lock makes revocation a barrier against queued input. New/changed Control grants require acknowledgement of owner-account execution privileges.
+Kernel-authenticated principals follow connections into server state. Bootstrap snapshots, agent/completion data, retained surfaces, graphics and notifications are scoped per recipient. View navigation and passive reads preserve owner focus and terminal geometry. Control supports terminal typing/mouse input and scoped native tab/pane operations. Owner configuration, custom server commands, worktrees, global APIs, plugins, cross-space moves, owner popups and legacy direct attach remain private.
 
-Preview adaptations to this specification:
+The native owner menu opens Space access in the same process with terminal restoration. Its user matrix shows live connection counts. Policy saves disconnect existing shared clients and cancel queued output/input before acknowledgement; clients clear their display and must reattach. This includes grant additions, making policy revisions consistent. Revocation cannot recall bytes already delivered or recipients’ retained copies.
 
-- Grants are bound to one live native server runtime. Restarting the sharing broker preserves them; restarting the native server requires regranting. Persistent workspace incarnations and automatic deleted-grant cleanup remain follow-up work.
-- The owner opens administration with `herdr --session <name> session access`. Native session-menu integration and live connected-client indicators remain pending.
-- Shared attachment uses a separate polling text frontend. Existing native client, direct attach, SSH bridge, graphics, events and global APIs remain private. Their non-owner protocol integration is pending, rather than being exposed with partial permission checks.
-- Already delivered output may remain visible until the next poll and can be retained by recipients. This preview makes no immediate client-cache-erasure claim.
-- User/operator instructions and explicit limitations are in `docs/next/shared-access.md`. Qualification scripts run only inside an explicitly disposable Linux container.
+Remaining release work:
 
-These adaptations are implemented safety boundaries, not evidence that every original acceptance gate or isolated-execution phase is complete. Beads retains the outstanding release work.
+- Grants bind to one live native runtime. Broker restarts preserve grants; a full server restart requires regranting. Durable workspace incarnations remain `herdr-17y.14`.
+- Native SSH/Cloud bridging and legacy direct terminal attachment are unavailable for non-owners. Participants SSH in as themselves and run the native shared command on the host.
+- Graphics use inline bytes; cross-account owner-file references and local image paste are disabled. Native attach/detach/denial coverage is not yet part of the bounded JSON broker audit; keystrokes are intentionally excluded. Broader lifecycle/audit qualification remains in the original issues.
+- Shared hosting is Linux-only. Windows runtime/cross-platform qualification was not performed. Frozen compatibility fixtures pass; an actual older binary run remains optional and was skipped.
+- Control retains the owner’s execution identity and privileges. Isolated workers remain a separate phase.
+
+Read `docs/next/shared-access.md` for use and recovery and `.local/prd/os-user-space-access-validation.md` for measured results. These are implemented boundaries, not a claim that every original lifecycle or isolated-execution requirement is complete.

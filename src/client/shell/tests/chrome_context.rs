@@ -420,6 +420,7 @@ fn global_menu_opens_from_sidebar_and_routes_client_actions() {
     assert!(matches!(state.overlay, Some(ClientShellOverlay::Help(_))));
 
     state.overlay = Some(ClientShellOverlay::GlobalMenu(ClientGlobalMenuOverlay {
+        space_access: false,
         highlighted: 3,
     }));
     let detach = state.handle_input_bytes(b"\r");
@@ -525,5 +526,37 @@ fn close_confirmation_error_becomes_client_owned_overlay_and_stable_workspace_cl
         &request.method,
         crate::api::schema::Method::WorkspaceClose(params)
             if params.workspace_id == "ws_1" && !params.close_group
+    ));
+}
+
+#[test]
+fn native_owner_space_access_menu_is_local_and_schedules_administration() {
+    let mut state = ClientShellState::new(ClientShellConfig::from_config(&Config::default()));
+    state.set_snapshot(Box::new(snapshot()));
+    state.set_pane_surface(surface());
+    state.enable_owner_space_access();
+    state.toggle_global_menu();
+    let frame = state.compose(106, 30).unwrap();
+    let text = frame
+        .cells
+        .iter()
+        .map(|cell| cell.symbol.as_str())
+        .collect::<String>();
+    assert!(text.contains("Space access"));
+    let mut outcome = ClientShellInput::default();
+    state.activate_global_menu_item(1, &mut outcome);
+    assert!(matches!(
+        outcome.actions.as_slice(),
+        [ClientShellAction::OwnerSpaceAccess]
+    ));
+    state.require_shared_access();
+    assert!(!state.owner_space_access_available());
+    state.toggle_global_menu();
+    assert!(matches!(
+        state.overlay,
+        Some(ClientShellOverlay::GlobalMenu(ClientGlobalMenuOverlay {
+            space_access: false,
+            ..
+        }))
     ));
 }

@@ -24,6 +24,8 @@ pub(crate) fn request_changes_ui(request: &Request) -> bool {
 }
 
 pub struct ApiRequestMessage {
+    pub(crate) native_client_id: Option<u64>,
+    pub(crate) native_shared: Option<crate::shared::native::NativeCommand>,
     pub(crate) shared_scope: Option<crate::shared::scope::SharedScope>,
     pub request: Request,
     pub respond_to: std::sync::mpsc::Sender<String>,

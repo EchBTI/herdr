@@ -1,5 +1,5 @@
 //! Explicit Linux shared-session client and owner administration surface.
-//! The native API and terminal protocol remain owner-only.
+//! Private sockets remain owner-only; shared native clients use a scoped endpoint.
 use std::io;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -9,6 +9,8 @@ use clap::{Arg, ArgAction, Command as Cli};
 use serde_json::{json, Value};
 
 pub(crate) mod broker;
+pub(crate) mod native;
+pub(crate) mod native_transport;
 pub(crate) mod scope;
 mod ui;
 
@@ -60,6 +62,7 @@ fn parser() -> Cli {
             )
             .subcommand(
                 Cli::new("attach")
+                    .arg(Arg::new("text").long("text").action(ArgAction::SetTrue))
                     .arg(Arg::new("owner").long("shared-owner").required(true))
                     .arg(
                         Arg::new("shared-session")
@@ -146,8 +149,10 @@ fn run(args: &[String]) -> io::Result<()> {
         let socket = shared_socket(account.uid, shared_session)?;
         return if options.get_flag("json") {
             print_json(&broker::request(&socket, account.uid, "spaces", json!({}))?)
-        } else {
+        } else if options.get_flag("text") {
             ui::attach(&socket, account.uid)
+        } else {
+            crate::client::run_shared_client(&socket.with_file_name("native"), account.uid)
         };
     }
     let owner = crate::platform::effective_uid()?;
@@ -279,6 +284,13 @@ fn set_grant(
             "expected_revision":state["revision"], "grants":grants, "acknowledge_owner_execution":ack
         }),
     )?)
+}
+
+/// Owner-only administration reuses the native client's terminal suspension path.
+pub(crate) fn run_owner_admin() -> io::Result<()> {
+    let owner = crate::platform::effective_uid()?;
+    let name = crate::session::active_name().unwrap_or_else(|| "default".into());
+    ui::admin(&shared_socket(owner, &name)?, owner)
 }
 
 #[cfg(test)]

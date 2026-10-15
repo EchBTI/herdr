@@ -25,4 +25,5 @@ WORKDIR /work
 COPY . /work
 RUN cargo build --locked --bin herdr
 ENV HERDR_SHARED_TEST_BINARY=/work/target/debug/herdr
-CMD ["python3", "scripts/test_shared_access.py"]
+# Qualify the scoped broker and the normal native Herdr TUI under real OS UIDs.
+CMD ["sh", "-c", "python3 scripts/test_shared_access.py && python3 scripts/test_shared_access_native.py"]

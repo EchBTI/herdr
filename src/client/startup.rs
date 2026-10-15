@@ -2,7 +2,7 @@ use super::*;
 
 /// Runs the thin client and enters the main event loop.
 pub fn run_client() -> io::Result<()> {
-    run_client_with_mode(None, None, "connecting to server")
+    run_client_with_mode(None, None, "connecting to server", None)
 }
 
 #[cfg(unix)]
@@ -11,6 +11,7 @@ pub fn run_terminal_attach(terminal_id: String, takeover: bool) -> io::Result<()
         Some((terminal_id, takeover)),
         Some(AttachEscapeState::default()),
         "attaching to terminal",
+        None,
     )
 }
 
@@ -21,4 +22,17 @@ pub fn run_terminal_attach(_terminal_id: String, _takeover: bool) -> io::Result<
         io::ErrorKind::Unsupported,
         "direct terminal attach is not supported on Windows yet",
     ))
+}
+
+/// Attach the full native TUI to an explicitly selected owner-authenticated endpoint.
+pub fn run_shared_client(socket: &std::path::Path, owner_uid: u32) -> io::Result<()> {
+    run_client_with_mode(
+        None,
+        None,
+        "connecting to shared session",
+        Some(SharedClientTarget {
+            socket_path: socket.to_owned(),
+            owner_uid,
+        }),
+    )
 }

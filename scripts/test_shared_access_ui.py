@@ -248,7 +248,7 @@ def main():
             check(len(grants) == 1 and grants[0]["role"] == "control", "acknowledged Control saves through the administration screen")
 
             rpc("pane.send_text", dict(pane_id=pane, text="printf 'UI_OUTPUT_SENTINEL\\n'\n"), native=True)
-            alice = Screen("alice", "session", "attach", "--shared-owner", "owner", "--shared-session", session)
+            alice = Screen("alice", "session", "attach", "--text", "--shared-owner", "owner", "--shared-session", session)
             alice.wait("UI_OUTPUT_SENTINEL")
             raw = alice.data.decode(errors="replace")
             check("ALICE_UI_ALLOWED" in raw and "BOB_UI_FORBIDDEN" not in raw
@@ -259,7 +259,7 @@ def main():
             alice.send(b"printf UI_; printf TYPED; printf '\\n'\r")
             alice.wait("UI_TYPED")
             check(True, "participant keyboard input reaches its controlled terminal")
-            bob = Screen("bob", "session", "attach", "--shared-owner", "owner", "--shared-session", session)
+            bob = Screen("bob", "session", "attach", "--text", "--shared-owner", "owner", "--shared-session", session)
             bob.wait("No spaces have been shared")
             check("ALICE_UI_ALLOWED" not in bob.data.decode(errors="replace"), "ungranted participant PTY displays empty state")
             bob.close()

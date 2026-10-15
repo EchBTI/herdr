@@ -64,6 +64,7 @@ async fn metadata_only_shell_is_isolated_until_surface_activation() {
 
     assert!(
         server.handle_server_event(ServerEvent::ClientShellConnected {
+            auth: None,
             surface_reuse: false,
             surface_delta: false,
             surface_scroll: false,
@@ -280,6 +281,7 @@ async fn background_surface_activation_preserves_focused_viewer_geometry() {
     let (writer, background_control, _) = test_client_writer();
     assert!(
         server.handle_server_event(ServerEvent::ClientShellConnected {
+            auth: None,
             surface_reuse: false,
             surface_delta: false,
             surface_scroll: false,
@@ -394,6 +396,7 @@ async fn presentation_sync_epoch_replays_modes_and_title() {
     let client_id = 63;
     assert!(
         server.handle_server_event(ServerEvent::ClientShellConnected {
+            auth: None,
             surface_reuse: false,
             surface_delta: false,
             surface_scroll: false,
@@ -511,6 +514,7 @@ async fn two_headless_servers_drive_atomic_endpoint_handoff() {
     let source_client_id = 78;
     assert!(
         source_server.handle_server_event(ServerEvent::ClientShellConnected {
+            auth: None,
             surface_reuse: false,
             surface_delta: false,
             surface_scroll: false,
@@ -535,6 +539,7 @@ async fn two_headless_servers_drive_atomic_endpoint_handoff() {
     let target_client_id = 79;
     assert!(
         target_server.handle_server_event(ServerEvent::ClientShellConnected {
+            auth: None,
             surface_reuse: false,
             surface_delta: false,
             surface_scroll: false,

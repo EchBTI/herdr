@@ -1,4 +1,4 @@
-# Shared-access preview validation
+# Shared-access validation
 
 Date: 15 October 2026. Baseline: `916fcf8de029c6cac965b50f3cdb9687cd7d1537`.
 
@@ -27,4 +27,19 @@ The host's newer Rust 1.99 `just check` stops on upstream lint changes in unchan
 
 An actual older-server binary compatibility run is optional in the qualification script and is reported as skipped unless `HERDR_SHARED_OLD_BINARY` is supplied. Rejection of the newly named private method is designed to fail closed; no unexecuted old-binary scenario is counted as a passing test.
 
-These checks qualify the restricted preview, not native shared-TUI parity or isolated execution. Grants require reassignment after a full native restart. Existing owner-only sockets remain private. Beads `herdr-17y.13` and `herdr-17y.14` track native-client parity and durable workspace incarnations respectively. The original feature epic remains open.
+The earlier checks above qualified the restricted preview. Native shared-client qualification follows below; isolated execution remains outside this release. Grants still require reassignment after a full native restart. Existing owner-only sockets remain private. Beads `herdr-17y.13` records completed native attachment and `herdr-17y.14` tracks durable workspace incarnations. The original feature epic remains open.
+
+## Native shared-client qualification (15 October 2026)
+
+This extends the earlier preview qualification above with the normal Herdr TUI. Final source passes:
+
+- Full `just test`: 3,952 Rust tests passed, 14 skipped; all maintenance, UI architecture, integration, runtime, watcher and documentation checks passed. This includes hidden bootstrap popups, agent-filter independence, passive View reads, foreground ownership and graphics scope regressions.
+- Pinned Linux Rust 1.96.1 strict all-target Clippy: passed with `-D warnings`.
+- Linux serial targeted tests: platform 104 passed / 2 ignored; shared 60 passed / 2 ignored; access 29 passed / 1 ignored. Filter selections overlap. An initial parallel platform run hit existing global-PATH clipboard fixture interference; serial execution passed.
+- Real multi-UID native qualification: 23 checks passed. Actual TUI terminal output, Control typing/splitting/mouse/workspace navigation, View denials and geometry preservation, owner visibility, hidden-wire sentinels, malicious guessed IDs, legacy negotiation rejection, revision disconnect/clear/reconnect, live connected-account reporting and sharing disable are exercised.
+- Existing broker 32-check and owner-admin/optional-text 18-check integration suites passed against the native-enabled build.
+- Formatting, Python syntax and diff whitespace checks passed. Frozen generation-1 fixture/digest/method contracts remain unchanged and pass in the full suite.
+
+The release-mode native shared profile measured median 193 µs at one populated pane and 237 µs at fifteen (+22.8%); p95 196 → 243 µs. This measures one shared client at fixed geometry and is supporting evidence, not a release throughput guarantee. Standard render profiles measured background server render 264 → 264 µs and active panes 266 → 316 µs. The complete `just bench-render-scale` command passed 7/8 profiles; the pre-existing native-file profile failed its working-CoW-retention precondition in this environment. That profile is not claimed passed.
+
+Final `just check` passed formatting and stopped on unchanged upstream Rust 1.99 Clippy findings in `ghostty-vt` (`chunks_exact_to_as_chunks` at lines 769/783). The pinned Linux strict lint and full local test recipe pass. Windows lint/runtime qualification was not reached. No actual older binary was supplied; that optional compatibility check remains skipped. Full-server-restart grant persistence and isolated execution remain unimplemented.
