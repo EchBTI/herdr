@@ -255,6 +255,28 @@ fn restore_with_imports(
     .0
 }
 
+/// Duplicate identities are all replaced before spawning, so the child's
+/// execution identity and persisted authorization identity always agree.
+fn snapshot_workspace_incarnations(snapshot: &SessionSnapshot) -> Vec<String> {
+    let mut counts = HashMap::new();
+    for workspace in &snapshot.workspaces {
+        if let Some(identity) = workspace.incarnation.as_deref() {
+            *counts.entry(identity).or_insert(0usize) += 1;
+        }
+    }
+    snapshot
+        .workspaces
+        .iter()
+        .map(|workspace| {
+            let value = workspace
+                .incarnation
+                .as_deref()
+                .filter(|value| counts.get(value).is_some_and(|count| *count == 1));
+            crate::workspace::restore_workspace_incarnation(value)
+        })
+        .collect()
+}
+
 fn restore_with_imports_and_failures(
     snapshot: &SessionSnapshot,
     history: Option<&SessionHistorySnapshot>,
@@ -276,6 +298,7 @@ fn restore_with_imports_and_failures(
         }
         matches
     });
+    let incarnations = snapshot_workspace_incarnations(snapshot);
     let mut workspaces = Vec::new();
     let mut terminals = HashMap::new();
     let mut terminal_runtimes = HashMap::new();
@@ -292,6 +315,7 @@ fn restore_with_imports_and_failures(
         };
         let (restored, workspace_failed_imports) = restore_workspace(
             ws_snap,
+            &incarnations[idx],
             history.and_then(|history| history.workspaces.get(idx)),
             rows,
             cols,
@@ -314,6 +338,7 @@ fn restore_with_imports_and_failures(
 
 fn restore_workspace(
     snap: &WorkspaceSnapshot,
+    incarnation: &str,
     history: Option<&WorkspaceHistorySnapshot>,
     rows: u16,
     cols: u16,
@@ -369,6 +394,8 @@ fn restore_workspace(
             history.and_then(|history| history.tabs.get(idx)),
             tab_number,
             &workspace_id,
+            incarnation,
+            snap.isolated_execution,
             rows,
             cols,
             runtime_context,
@@ -414,6 +441,8 @@ fn restore_workspace(
     (
         Some(Workspace {
             id: workspace_id,
+            incarnation: incarnation.to_owned(),
+            isolated_execution: snap.isolated_execution,
             custom_name: snap.custom_name.clone(),
             identity_cwd: snap.identity_cwd.clone(),
             cached_identity_cwd: snap.identity_cwd.clone(),
@@ -488,11 +517,15 @@ pub(crate) fn restored_worktree_space_membership(
     })
 }
 
+// Restoration keeps identity and execution policy explicit alongside imported runtimes.
+#[allow(clippy::too_many_arguments)]
 fn restore_tab(
     snap: &TabSnapshot,
     history: Option<&TabHistorySnapshot>,
     number: usize,
     workspace_id: &str,
+    workspace_incarnation: &str,
+    isolated_execution: bool,
     rows: u16,
     cols: u16,
     runtime_context: &RestoreRuntimeContext<'_>,
@@ -571,11 +604,14 @@ fn restore_tab(
             .map(String::as_str);
         let launch_env = public_pane_id
             .map(|pane_id| {
-                PaneLaunchEnv::from_extra(Vec::new()).with_identity(
-                    workspace_id.to_string(),
-                    crate::workspace::public_tab_id_for_number(workspace_id, number),
-                    pane_id.to_string(),
-                )
+                PaneLaunchEnv::from_extra(Vec::new())
+                    .with_identity(
+                        workspace_id.to_string(),
+                        crate::workspace::public_tab_id_for_number(workspace_id, number),
+                        pane_id.to_string(),
+                    )
+                    .with_workspace_incarnation(workspace_incarnation.to_owned())
+                    .with_isolation_required(isolated_execution)
             })
             .unwrap_or_default();
         let imported_runtime = old_pane_id.and_then(|old_id| imported_panes.remove(&old_id));
@@ -751,8 +787,11 @@ fn restore_tab(
                 );
                 if !was_imported {
                     let terminal = unavailable_restored_terminal(
-                        saved_pane, cwd,
-                        format!("Could not start the saved shell: {e}. Fix the shell configuration and restart this session."),
+                        saved_pane,
+                        cwd,
+                        format!(
+                            "Could not start the saved shell: {e}. Fix the shell configuration and restart this session."
+                        ),
                     );
                     panes.insert(*id, PaneState::new(terminal.id.clone()));
                     terminals.push(terminal);
@@ -1528,6 +1567,8 @@ mod tests {
         let snapshot = SessionSnapshot {
             version: super::super::snapshot::SNAPSHOT_VERSION,
             workspaces: vec![WorkspaceSnapshot {
+                incarnation: None,
+                isolated_execution: false,
                 id: Some("workspace".into()),
                 custom_name: None,
                 identity_cwd: cwd.clone(),
@@ -1609,6 +1650,8 @@ mod tests {
         let snapshot = SessionSnapshot {
             version: super::super::snapshot::SNAPSHOT_VERSION,
             workspaces: vec![WorkspaceSnapshot {
+                incarnation: None,
+                isolated_execution: false,
                 id: Some("w1".into()),
                 custom_name: None,
                 identity_cwd: cwd.clone(),
@@ -1722,6 +1765,8 @@ mod tests {
         let snapshot = SessionSnapshot {
             version: super::super::snapshot::SNAPSHOT_VERSION,
             workspaces: vec![WorkspaceSnapshot {
+                incarnation: None,
+                isolated_execution: false,
                 id: Some("w1".into()),
                 custom_name: None,
                 identity_cwd: cwd.clone(),
@@ -1805,6 +1850,8 @@ mod tests {
     fn legacy_restore_precomputes_missing_public_pane_numbers() {
         let cwd = std::env::current_dir().unwrap();
         let snapshot = WorkspaceSnapshot {
+            incarnation: None,
+            isolated_execution: false,
             id: Some("w1".into()),
             custom_name: None,
             identity_cwd: cwd,
@@ -1844,6 +1891,8 @@ mod tests {
         let snapshot = SessionSnapshot {
             version: super::super::snapshot::SNAPSHOT_VERSION,
             workspaces: vec![WorkspaceSnapshot {
+                incarnation: None,
+                isolated_execution: false,
                 id: Some("workspace".into()),
                 custom_name: None,
                 identity_cwd: cwd.clone(),
@@ -2200,6 +2249,8 @@ mod tests {
         let snapshot = SessionSnapshot {
             version: super::super::snapshot::SNAPSHOT_VERSION,
             workspaces: vec![WorkspaceSnapshot {
+                incarnation: None,
+                isolated_execution: false,
                 id: Some("workspace".into()),
                 custom_name: None,
                 identity_cwd: cwd,
@@ -2226,5 +2277,64 @@ mod tests {
         };
         history.layout_fingerprint = super::super::snapshot::layout_fingerprint(&snapshot);
         (snapshot, history)
+    }
+}
+
+#[cfg(test)]
+mod workspace_incarnation_tests {
+    use super::*;
+
+    fn captured() -> SessionSnapshot {
+        let workspace = Workspace::test_new("same name and directory");
+        super::super::snapshot::capture(
+            &[workspace],
+            &HashMap::new(),
+            &Default::default(),
+            Some(0),
+            0,
+        )
+    }
+
+    #[test]
+    fn persisted_incarnation_survives_restart_and_json_handoff() {
+        let snapshot = captured();
+        let original = snapshot.workspaces[0].incarnation.clone().unwrap();
+        assert!(crate::workspace::valid_workspace_incarnation(&original));
+        let restored: SessionSnapshot =
+            serde_json::from_slice(&serde_json::to_vec(&snapshot).unwrap()).unwrap();
+        assert_eq!(snapshot_workspace_incarnations(&restored), vec![original]);
+        let recreated = captured();
+        assert_ne!(
+            recreated.workspaces[0].incarnation,
+            snapshot.workspaces[0].incarnation
+        );
+    }
+
+    #[test]
+    fn missing_invalid_and_duplicate_imports_all_receive_fresh_identities() {
+        let mut value = serde_json::to_value(captured()).unwrap();
+        let original = value["workspaces"][0]["incarnation"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let duplicate = value["workspaces"][0].clone();
+        value["workspaces"].as_array_mut().unwrap().push(duplicate);
+        let duplicated: SessionSnapshot = serde_json::from_value(value.clone()).unwrap();
+        let identities = snapshot_workspace_incarnations(&duplicated);
+        assert_ne!(identities[0], original);
+        assert_ne!(identities[1], original);
+        assert_ne!(identities[0], identities[1]);
+        value["workspaces"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("incarnation");
+        value["workspaces"][1]["incarnation"] = "untrusted legacy identity".into();
+        let legacy: SessionSnapshot = serde_json::from_value(value).unwrap();
+        let migrated = snapshot_workspace_incarnations(&legacy);
+        assert!(migrated
+            .iter()
+            .all(|identity| crate::workspace::valid_workspace_incarnation(identity)));
+        assert_ne!(migrated[0], migrated[1]);
+        assert!(migrated.iter().all(|identity| identity != &original));
     }
 }

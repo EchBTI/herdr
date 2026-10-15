@@ -235,7 +235,14 @@ impl From<serde_json::Error> for ApiClientError {
 }
 
 fn write_request(stream: &mut LocalStream, request: &Request) -> Result<(), ApiClientError> {
-    stream.write_all(serde_json::to_string(request)?.as_bytes())?;
+    let value = match std::env::var(crate::platform::isolated_worker::WORKER_TOKEN_ENV) {
+        Ok(token) => {
+            serde_json::json!({"id":request.id,"method":"worker.execute.v1","params":{"token":token,"request":request}})
+        }
+        Err(std::env::VarError::NotPresent) => serde_json::to_value(request)?,
+        Err(error) => return Err(io::Error::other(error).into()),
+    };
+    stream.write_all(serde_json::to_string(&value)?.as_bytes())?;
     stream.write_all(b"\n")?;
     stream.flush()?;
     Ok(())

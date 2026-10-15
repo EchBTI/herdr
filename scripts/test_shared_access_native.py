@@ -301,6 +301,22 @@ def main():
             grant("alice", alice, "control")
             grant("alice", view, "view")
             grant("bob", view, "view")
+            view_tab=next(t["tab_id"] for t in state["tabs"] if t["workspace_id"]==view)
+            denied_calls=[("pane.focus",dict(pane_id=panes[view])),
+                          ("pane.focus_direction",dict(pane_id=panes[view],direction="left")),
+                          ("pane.scroll",dict(pane_id=panes[view],offset_from_bottom=1)),
+                          ("pane.rename",dict(pane_id=panes[view],label="MUST_NOT_RENAME")),
+                          ("tab.rename",dict(tab_id=view_tab,label="MUST_NOT_RENAME")),
+                          ("tab.create",dict(workspace_id=view,cwd="/home/owner")),
+                          ("workspace.rename",dict(workspace_id=view,label="MUST_NOT_RENAME")),
+                          ("workspace.create",dict(label="MUST_NOT_CREATE",cwd="/home/owner")),
+                          ("server.stop",{}),("server.reload_config",{}),("future.unclassified.v999",{})]
+            direct_view=native_probe(1002,denied_calls)
+            check(len(direct_view.get("responses",[]))==len(denied_calls)
+                  and all("error" in response for response in direct_view["responses"]),
+                  "untrusted native View client cannot bypass UI guards through viewport mutations, global operations or unknown methods")
+            check("MUST_NOT" not in json.dumps(snapshot()) and server.poll() is None,
+                  "denied native method matrix leaves owner runtime and workspace metadata unchanged")
             check(os.stat(pathlib.Path(fixture.SHARED).with_name("native")).st_mode & 0o777 == 0o660,
                   "native shared endpoint retains the OS group socket boundary")
             rejected = native_probe(1001, [], negotiate=False)
@@ -391,6 +407,48 @@ def main():
             check(refreshed["controls"]["shared.access.v1"]["workspaces"] == {view: "view"}
                   and "NATIVE_ALICE" not in refreshed["wire"],
                   "reconnected native client receives only remaining grants")
+            saved_grants=fixture.result(fixture.OWNER,"grants.get")["grants"]
+            fixture.cli(fixture.OWNER,"--session",fixture.SESSION,"server","stop")
+            server.wait(timeout=10)
+            check("error" in fixture.request(1001,"spaces"),"stopped native daemon leaves its old broker fail closed")
+            server=subprocess.Popen([fixture.BIN,"--session",fixture.SESSION,"server"],preexec_fn=fixture.identity(fixture.OWNER),env=fixture.env(fixture.OWNER),stdout=log,stderr=log)
+            fixture.wait(fixture.PRIVATE)
+            check("error" in fixture.request(1001,"spaces"),"old broker cannot attach its grants to an unverified replacement daemon")
+            fixture.cli(fixture.OWNER,"--session",fixture.SESSION,"session","share","disable")
+            fixture.cli(fixture.OWNER,"--session",fixture.SESSION,"session","share","enable","--group","herdr-test")
+            check(fixture.result(fixture.OWNER,"grants.get")["grants"]==saved_grants,"native daemon restart preserves durable account and incarnation grant bindings")
+            restarted=native_probe(1001,[])
+            check(restarted["controls"]["shared.access.v1"]["workspaces"]=={view:"view"}
+                  and "NATIVE_ALICE" not in restarted["wire"],"full native attachment restores only the remaining durable grant after restart")
+            owner_rpc("pane.send_text",dict(pane_id=panes[view],text="printf ACCOUNT_; printf DEPROVISION_OUTPUT; printf '\\n'\n"))
+            account_screen=shared_screen(1001)
+            account_screen.wait("ACCOUNT_DEPROVISION_OUTPUT")
+            renamed=False
+            try:
+                # --prefix models an NSS/account-store change while the old UID
+                # still owns a client process. Ordinary usermod's process-busy
+                # guard would otherwise prohibit this deprovisioning fixture.
+                # main()'s disposable-root guard runs before this mutation.
+                subprocess.run(["usermod","--prefix","/","--login","alice-renamed","alice"],check=True)
+                renamed=True
+                deadline=time.monotonic()+15
+                while not account_screen.closed and time.monotonic()<deadline:
+                    account_screen.drain(.1)
+                check(account_screen.closed and "shared session disconnected" in account_screen.data.decode(errors="replace").lower(),
+                      "OS account rename disconnects its existing native client within the refresh bound")
+                check("ACCOUNT_DEPROVISION_OUTPUT" not in account_screen.text(),
+                      "account invalidation clears previously visible native terminal content")
+                grants_after_rename=fixture.result(fixture.OWNER,"grants.get")["grants"]
+                check(not any(g["uid"]==1001 for g in grants_after_rename),
+                      "changed OS account identity permanently prunes the old UID/account grants")
+            finally:
+                account_screen.close()
+                if renamed:
+                    subprocess.run(["usermod","--prefix","/","--login","alice","alice-renamed"],check=True)
+            returning=native_probe(1001,[])
+            check(returning["controls"]["shared.access.v1"]["workspaces"]=={}
+                  and not any(g["uid"]==1001 for g in fixture.result(fixture.OWNER,"grants.get")["grants"]),
+                  "restoring the OS account name does not resurrect pruned grants")
             fixture.cli(fixture.OWNER, "--session", fixture.SESSION, "session", "share", "disable")
             check(not pathlib.Path(fixture.SHARED).with_name("native").exists() and server.poll() is None,
                   "sharing disable removes native listener while the owner runtime keeps running")

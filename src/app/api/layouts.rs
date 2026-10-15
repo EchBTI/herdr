@@ -360,7 +360,8 @@ impl App {
                 .focused();
             self.launch_cwd_for_pane_in_workspace(ws_idx, pane_id)
         });
-        self.resolve_new_terminal_cwd(
+        self.resolve_new_terminal_cwd_in_workspace(
+            ws_idx,
             follow_cwd.or_else(|| self.focused_pane_cwd_in_workspace(ws_idx)),
         )
     }

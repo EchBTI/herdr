@@ -265,3 +265,10 @@ default-config:
 test-shared-access-linux:
     docker build -f scripts/shared-access-test.Dockerfile -t herdr-shared-test .
     docker run --rm -e HERDR_SHARED_TEST_DISPOSABLE=1 herdr-shared-test
+
+# Rootless worker qualification only in a disposable image with no host mounts.
+# The outer flags allow nested namespaces/procfs; the worker itself gains no host capabilities.
+[unix]
+test-isolated-workers-linux:
+    docker build -f scripts/shared-access-test.Dockerfile -t herdr-shared-test .
+    docker run --rm --security-opt seccomp=unconfined --security-opt systempaths=unconfined -e HERDR_SHARED_TEST_DISPOSABLE=1 herdr-shared-test python3 scripts/test_isolated_workers.py

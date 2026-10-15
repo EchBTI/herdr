@@ -169,10 +169,54 @@ fn scoped_native(
 }
 
 fn snapshot(client: &ApiClient) -> io::Result<Value> {
-    native(client, "session.snapshot", json!({}))?
+    let mut snapshot = native(client, "session.snapshot", json!({}))?
         .get("snapshot")
         .cloned()
+        .ok_or_else(denied)?;
+    let identities = crate::shared::native::control(
+        &client.socket_path(),
+        crate::shared::native::NativeCommand::WorkspaceIdentities,
+    )?;
+    for workspace in snapshot
+        .get_mut("workspaces")
+        .and_then(Value::as_array_mut)
+        .into_iter()
+        .flatten()
+    {
+        let identity = workspace
+            .get("workspace_id")
+            .and_then(Value::as_str)
+            .and_then(|id| identities["workspace_incarnations"][id].as_str())
+            .filter(|identity| crate::workspace::valid_workspace_incarnation(identity))
+            .unwrap_or_default()
+            .to_owned();
+        workspace["incarnation"] = Value::String(identity);
+    }
+    Ok(snapshot)
+}
+
+fn workspace_incarnation<'a>(snapshot: &'a Value, workspace_id: &str) -> io::Result<&'a str> {
+    items(snapshot, "workspaces")
+        .find(|workspace| workspace["workspace_id"].as_str() == Some(workspace_id))
+        .and_then(|workspace| workspace["incarnation"].as_str())
+        .filter(|identity| crate::workspace::valid_workspace_incarnation(identity))
         .ok_or_else(denied)
+}
+
+/// Owner clients supply public IDs; only authoritative server identities can
+/// bind a newly created grant. Existing stale grants are never rebound.
+fn bind_new_grants(grants: &mut [Grant], existing: &[Grant], state: &Value) -> io::Result<()> {
+    for grant in grants {
+        if existing.contains(grant) {
+            continue;
+        }
+        let incarnation = workspace_incarnation(state, &grant.workspace_id)?;
+        if !grant.workspace_incarnation.is_empty() && grant.workspace_incarnation != incarnation {
+            return Err(denied());
+        }
+        grant.workspace_incarnation = incarnation.to_owned();
+    }
+    Ok(())
 }
 
 fn items<'a>(value: &'a Value, key: &str) -> impl Iterator<Item = &'a Value> {
@@ -237,7 +281,8 @@ fn project_spaces(snapshot: &Value, policy: &AccessPolicy, caller: &Caller) -> V
     let workspaces: Vec<_> = items(snapshot, "workspaces")
         .filter_map(|workspace| {
             let id = workspace.get("workspace_id")?.as_str()?;
-            if !policy.authorize(caller, Action::Read, Some(id)) {
+            let incarnation = workspace_incarnation(snapshot, id).ok()?;
+            if !policy.authorize(caller, Action::Read, Some((id, incarnation))) {
                 return None;
             }
             let tabs: Vec<_> = items(snapshot, "tabs")
@@ -261,7 +306,7 @@ fn project_spaces(snapshot: &Value, policy: &AccessPolicy, caller: &Caller) -> V
                 .collect();
             let role = if policy.is_owner(caller) {
                 "owner"
-            } else if policy.authorize(caller, Action::Control, Some(id)) {
+            } else if policy.authorize(caller, Action::Control, Some((id, incarnation))) {
                 "control"
             } else {
                 "view"
@@ -285,7 +330,8 @@ fn check_pane(
 ) -> io::Result<SharedScope> {
     let state = snapshot(client)?;
     let workspace = workspace_for_pane(&state, pane_id)?;
-    if !policy.authorize(caller, action, Some(workspace)) {
+    let incarnation = workspace_incarnation(&state, workspace)?;
+    if !policy.authorize(caller, action, Some((workspace, incarnation))) {
         return Err(denied());
     }
     let pane = items(&state, "panes")
@@ -293,6 +339,7 @@ fn check_pane(
         .ok_or_else(denied)?;
     Ok(SharedScope {
         workspace_id: workspace.to_owned(),
+        workspace_incarnation: incarnation.to_owned(),
         pane_id: pane_id.to_owned(),
         terminal_id: string(pane, "terminal_id")
             .map_err(|_| denied())?
@@ -506,11 +553,12 @@ impl Context<'_> {
                             .get("expected_revision")
                             .and_then(Value::as_u64)
                             .ok_or_else(invalid)?;
-                        let grants: Vec<Grant> = serde_json::from_value(
+                        let mut grants: Vec<Grant> = serde_json::from_value(
                             params.get("grants").cloned().ok_or_else(invalid)?,
                         )
                         .map_err(|_| invalid())?;
                         let state = snapshot(self.client)?;
+                        bind_new_grants(&mut grants, policy.grants(), &state)?;
                         validate_new_grants(&grants, policy.grants(), &state, |uid| {
                             Ok(
                                 crate::platform::os_account_by_uid(uid)?
@@ -524,13 +572,13 @@ impl Context<'_> {
                         let candidate = policy
                             .replace_grants(&caller, revision, grants, acknowledgement)
                             .map_err(|_| invalid())?;
-                        self.store.save(&candidate).map_err(|_| denied())?;
                         crate::shared::native::control(
                             &self.client.socket_path(),
-                            crate::shared::native::NativeCommand::Refresh,
+                            crate::shared::native::NativeCommand::CommitPolicy {
+                                policy: Box::new(candidate),
+                            },
                         )
-                        .map_err(|_| denied())?;
-                        json!({"revision":candidate.revision(),"grants":candidate.grants()})
+                        .map_err(|_| denied())?
                     }
                     _ => {
                         only_fields(params, &[])?;
@@ -578,11 +626,13 @@ pub(super) fn serve(
         return Err(invalid());
     }
     crate::platform::access_store::prepare_directory(policy_dir, owner_uid)?;
-    let runtime_policy_dir = policy_dir.join(&runtime_identity);
+    // V1 runtime-bound stores remain untouched and are never auto-imported.
+    // A separate namespace gives this upgrade an explicit default-deny boundary.
+    let runtime_policy_dir = policy_dir.join("durable-v2");
     let store = PolicyStore::new(
         &runtime_policy_dir,
         owner_uid,
-        format!("{}:{}", crate::platform::host_identity()?, runtime_identity),
+        crate::access::policy_host_identity()?,
     );
     load(&store)?;
     let listener = shared_transport::bind_listener(socket, group_gid)?;
@@ -597,6 +647,7 @@ pub(super) fn serve(
         let _ = shared_transport::remove_socket(socket);
         return Err(error);
     }
+    let audit = crate::shared::audit::Audit::new(policy_dir, owner_uid)?;
     let context = Context {
         store: &store,
         client: &client,
@@ -619,19 +670,18 @@ pub(super) fn serve(
         };
         let outcome = context.execute(identity.uid, &request);
         let revision = load(&store).map(|policy| policy.revision()).ok();
-        let record = json!({
-            "unix_seconds":std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|time|time.as_secs()).unwrap_or(0),
-            "uid":identity.uid,
-            "operation":if METHODS.contains(&request.method.as_str()) { request.method.as_str() } else { "unknown" },
-            "outcome":if outcome.is_ok() {"allowed"} else {"denied"},"revision":revision,
-        });
-        if let Ok(bytes) = serde_json::to_vec(&record) {
-            if let Err(error) =
-                crate::platform::access_store::append_audit(policy_dir, owner_uid, &bytes)
-            {
-                tracing::warn!(%error,"shared-session audit record unavailable");
-            }
-        }
+        let operation = METHODS
+            .iter()
+            .copied()
+            .find(|method| *method == request.method)
+            .unwrap_or("unknown");
+        audit.record(
+            identity.uid,
+            revision.unwrap_or(0),
+            operation,
+            if outcome.is_ok() { "allowed" } else { "denied" },
+            None,
+        );
         let (response, stop) = match outcome {
             Ok((result, stop)) => (json!({"id":request.id,"result":result}), stop),
             Err(_) => (
@@ -667,7 +717,7 @@ mod tests {
     use crate::access::Role;
 
     fn state() -> Value {
-        json!({"workspaces":[{"workspace_id":"allowed","label":"Public","tokens":{"secret":"hidden"}},
+        json!({"workspaces":[{"workspace_id":"allowed","incarnation":"wi_00000000000000000000000000000001","label":"Public","tokens":{"secret":"hidden"}},
             {"workspace_id":"hidden","label":"FORBIDDEN"}],
             "tabs":[{"workspace_id":"allowed","tab_id":"tab1","label":"Public tab"},
                 {"workspace_id":"hidden","tab_id":"secret-tab","label":"FORBIDDEN"}],
@@ -689,6 +739,7 @@ mod tests {
                     uid: 1001,
                     account_name: "alice".into(),
                     workspace_id: "allowed".into(),
+                    workspace_incarnation: "wi_00000000000000000000000000000001".into(),
                     role: Role::View,
                 }],
                 false,
@@ -698,7 +749,11 @@ mod tests {
         assert!(!projected.to_string().contains("FORBIDDEN"));
         assert!(!projected.to_string().contains("secret"));
         assert_eq!(projected["workspaces"][0]["role"], "view");
-        assert!(!policy.authorize(&participant, Action::Control, Some("allowed")));
+        assert!(!policy.authorize(
+            &participant,
+            Action::Control,
+            Some(("allowed", "wi_00000000000000000000000000000001"))
+        ));
         assert_eq!(
             project_spaces(
                 &state(),

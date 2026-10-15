@@ -10,6 +10,7 @@ fn grant(role: Role) -> Grant {
         uid: 1001,
         account_name: "alice".into(),
         workspace_id: "space-a".into(),
+        workspace_incarnation: "wi_00000000000000000000000000000001".into(),
         role,
     }
 }
@@ -31,15 +32,23 @@ fn role_operation_matrix_defaults_deny() {
         ] {
             assert!(policy.authorize(&owner(), action, None));
             assert_eq!(
-                policy.authorize(&alice(), action, Some("space-a")),
+                policy.authorize(
+                    &alice(),
+                    action,
+                    Some(("space-a", "wi_00000000000000000000000000000001"))
+                ),
                 action == Action::Read || (role == Role::Control && action == Action::Control)
             );
-            assert!(!policy.authorize(&alice(), action, Some("space-b")));
+            assert!(!policy.authorize(
+                &alice(),
+                action,
+                Some(("space-b", "wi_00000000000000000000000000000001"))
+            ));
             assert!(!policy.authorize(&alice(), action, None));
             assert!(!policy.authorize(
                 &Caller::verified(1002, Some("alice".into())),
                 action,
-                Some("space-a")
+                Some(("space-a", "wi_00000000000000000000000000000001"))
             ));
         }
     }
@@ -48,7 +57,11 @@ fn role_operation_matrix_defaults_deny() {
 fn unresolved_or_reused_accounts_suspend_grants() {
     let policy = policy(Role::Control);
     for name in [None, Some("replacement".into())] {
-        assert!(!policy.authorize(&Caller::verified(1001, name), Action::Read, Some("space-a")));
+        assert!(!policy.authorize(
+            &Caller::verified(1001, name),
+            Action::Read,
+            Some(("space-a", "wi_00000000000000000000000000000001"))
+        ));
     }
 }
 #[test]
@@ -83,8 +96,16 @@ fn deletion_revokes_without_resurrection() {
     let deleted = policy.delete_workspace(&owner(), 1, "space-a").unwrap();
     assert_eq!(deleted.revision(), 2);
     assert!(deleted.grants().is_empty());
-    assert!(!deleted.authorize(&alice(), Action::Read, Some("space-a")));
-    assert!(!deleted.authorize(&alice(), Action::Read, Some("new-space-same-name")));
+    assert!(!deleted.authorize(
+        &alice(),
+        Action::Read,
+        Some(("space-a", "wi_00000000000000000000000000000001"))
+    ));
+    assert!(!deleted.authorize(
+        &alice(),
+        Action::Read,
+        Some(("new-space-same-name", "wi_00000000000000000000000000000001"))
+    ));
 }
 #[test]
 fn invalid_schema_duplicate_grants_and_owner_grants_are_rejected() {
@@ -176,4 +197,58 @@ fn saving_revoke_waits_for_native_execution_lock() {
         .unwrap();
     thread.join().unwrap();
     std::fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn durable_grants_survive_same_identity_but_never_reused_public_ids() {
+    let policy = policy(Role::Control);
+    let original = "wi_00000000000000000000000000000001";
+    let replacement = "wi_00000000000000000000000000000002";
+    let persisted: AccessPolicy =
+        serde_json::from_slice(&serde_json::to_vec(&policy).unwrap()).unwrap();
+    assert!(persisted.authorize(&alice(), Action::Control, Some(("space-a", original))));
+    assert!(!persisted.authorize(&alice(), Action::Read, Some(("space-a", replacement))));
+    assert!(!persisted.authorize(&alice(), Action::Read, Some(("space-a", ""))));
+    let unchanged = std::collections::HashMap::from([("space-a".into(), original.into())]);
+    assert!(persisted
+        .retain_workspaces(&owner(), 1, &unchanged)
+        .unwrap()
+        .is_none());
+    let replaced = std::collections::HashMap::from([("space-a".into(), replacement.into())]);
+    let pruned = persisted
+        .retain_workspaces(&owner(), 1, &replaced)
+        .unwrap()
+        .unwrap();
+    assert_eq!(pruned.revision(), 2);
+    assert!(pruned.grants().is_empty());
+    assert!(!pruned.authorize(&alice(), Action::Read, Some(("space-a", original))));
+    let deleted = persisted
+        .retain_workspaces(&owner(), 1, &std::collections::HashMap::new())
+        .unwrap()
+        .unwrap();
+    assert!(deleted.grants().is_empty());
+}
+
+#[test]
+fn legacy_grant_schema_and_missing_incarnation_are_fail_closed() {
+    let original = policy(Role::View);
+    let mut value = serde_json::to_value(&original).unwrap();
+    value["schema_version"] = 1.into();
+    assert!(serde_json::from_value::<AccessPolicy>(value)
+        .unwrap()
+        .validate()
+        .is_err());
+    let mut value = serde_json::to_value(&original).unwrap();
+    value["grants"][0]
+        .as_object_mut()
+        .unwrap()
+        .remove("workspace_incarnation");
+    assert!(serde_json::from_value::<AccessPolicy>(value)
+        .unwrap()
+        .validate()
+        .is_err());
+    let copied_host = PolicyStore::new("/unused", 1000, "other-host:1000:owner".into());
+    assert!(copied_host.check_binding(&original).is_err());
+    let reused_owner = PolicyStore::new("/unused", 1000, "host-a:1000:replacement-account".into());
+    assert!(reused_owner.check_binding(&original).is_err());
 }

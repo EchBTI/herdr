@@ -45,6 +45,7 @@ impl App {
             .state
             .workspaces
             .iter()
+            .filter(|workspace| !workspace.isolated_execution)
             .filter_map(|workspace| {
                 workspace
                     .worktree_space
@@ -62,6 +63,12 @@ impl App {
 
     pub(crate) fn start_restored_worktree_validation(&mut self, now: Instant) {
         self.restored_worktree_validation_retry_at = None;
+        self.pending_restored_worktree_spaces.retain(|(id, _)| {
+            self.state
+                .workspaces
+                .iter()
+                .any(|workspace| &workspace.id == id && !workspace.isolated_execution)
+        });
         let jobs = Arc::new(self.pending_restored_worktree_spaces.clone());
         let next = Arc::new(AtomicUsize::new(0));
         let worker_count = jobs.len().min(4);
@@ -176,7 +183,11 @@ impl App {
 
     pub(crate) fn git_refresh_deadline(&self) -> Option<Instant> {
         (!self.git_refresh_in_flight
-            && !self.state.workspaces.is_empty()
+            && self
+                .state
+                .workspaces
+                .iter()
+                .any(|workspace| !workspace.isolated_execution)
             && (self.git_identity_refresh_requested || !self.git_refresh_demand().is_empty()))
         .then_some(self.last_git_remote_status_refresh + GIT_REMOTE_STATUS_REFRESH_INTERVAL)
     }
@@ -200,9 +211,13 @@ impl App {
         self.state
             .workspaces
             .iter()
+            .filter(|workspace| !workspace.isolated_execution)
             .filter_map(|ws| {
                 let cwd =
                     ws.resolved_identity_cwd_from(&self.state.terminals, &self.terminal_runtimes)?;
+                if !crate::shared::worker::host_git_path_allowed(&cwd) {
+                    return None;
+                }
                 let cache_key_hint = (!refresh_repo_discovery && ws.cached_identity_cwd == cwd)
                     .then(|| ws.cached_git_status_key.clone());
                 Some(WorkspaceGitRefreshItem {
@@ -785,6 +800,27 @@ mod tests {
             .git_refresh_deadline()
             .expect("refresh should be due once a workspace exists");
         assert!(deadline <= Instant::now());
+    }
+
+    #[test]
+    fn isolated_workspaces_never_schedule_owner_git_or_worktree_discovery() {
+        let mut app = test_app(&crate::config::Config::default());
+        let mut workspace = Workspace::test_new("isolated");
+        workspace.isolated_execution = true;
+        workspace.cached_git_branch = Some("stale owner branch".into());
+        workspace.cached_git_ahead_behind = Some((1, 2));
+        app.state.workspaces = vec![workspace];
+        app.state.active = Some(0);
+        assert!(app.workspace_git_refresh_items(true).is_empty());
+        assert!(app.workspace_git_refresh_items(false).is_empty());
+        app.refresh_restored_workspace_git_metadata();
+        assert!(app.pending_restored_worktree_spaces.is_empty());
+        assert!(!app.git_refresh_in_flight);
+        assert!(app.git_refresh_deadline().is_none());
+        assert!(app.state.workspaces[0].branch().is_none());
+        assert!(app.state.workspaces[0].git_ahead_behind().is_none());
+        assert!(app.state.workspaces[0].git_space().is_none());
+        assert!(app.state.workspaces[0].worktree_space().is_none());
     }
 
     fn test_app(config: &crate::config::Config) -> super::super::App {

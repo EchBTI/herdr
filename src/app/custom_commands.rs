@@ -214,6 +214,16 @@ impl App {
         binding: &crate::config::CustomCommandKeybind,
         selected_text: Option<String>,
     ) -> io::Result<()> {
+        if binding.action != crate::config::CustomCommandAction::Pane
+            && self
+                .state
+                .active
+                .and_then(|index| self.state.workspaces.get(index))
+                .is_some_and(|workspace| workspace.isolated_execution)
+        {
+            return Err(io::Error::new(io::ErrorKind::PermissionDenied,
+                "owner shell, popup and plugin commands are unavailable inside an isolated workspace; use an isolated pane command"));
+        }
         match binding.action {
             crate::config::CustomCommandAction::Shell => self.spawn_custom_command(binding),
             crate::config::CustomCommandAction::Pane => {
@@ -595,6 +605,27 @@ mod tests {
 
     fn install(app: &mut crate::app::App, binding: crate::config::CustomCommandKeybind) {
         app.endpoint_commands = super::EndpointCommandRegistry::new(&[binding]);
+    }
+
+    #[test]
+    fn isolated_execution_rejects_owner_shell_popup_and_plugin_custom_commands() {
+        let mut app = test_app();
+        app.state.workspaces = vec![crate::workspace::Workspace::test_new("isolated")];
+        app.state.workspaces[0].isolated_execution = true;
+        app.state.active = Some(0);
+        for action in [
+            crate::config::CustomCommandAction::Shell,
+            crate::config::CustomCommandAction::Popup,
+            crate::config::CustomCommandAction::PluginAction,
+        ] {
+            let error = app
+                .execute_custom_command_binding(&binding(action), None)
+                .unwrap_err();
+            assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+            assert!(error.to_string().contains("isolated workspace"));
+        }
+        assert!(app.state.popup_pane.is_none());
+        assert!(app.terminal_runtimes.iter().next().is_none());
     }
 
     #[test]

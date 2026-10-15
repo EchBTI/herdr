@@ -2,7 +2,7 @@
 
 This EchBTI fork lets multiple Linux OS accounts use the normal Herdr terminal interface with per-space permissions. The owner runs Herdr normally, enables a group-scoped endpoint, and assigns Linux users View or Control access to specific spaces. Participants log in as themselves and attach using the owner's account name. The native owner client and its unrestricted sockets remain private.
 
-This is a trusted-collaboration preview. Control lets a participant run commands with the terminal owner's OS privileges, including access to that account's files, credentials and private sockets. Use View for observers. This release does not isolate mutually untrusted controllers or confidential client projects from one another.
+Ordinary spaces use trusted collaboration: Control runs commands with the terminal owner's OS privileges, including access to that account's files, credentials and private sockets. Use View for observers. Linux owners can explicitly migrate selected spaces to the isolated-worker mode described below. Hiding a trusted space does not isolate its files from another owner-privileged shell.
 
 ## Host preparation
 
@@ -29,7 +29,7 @@ herdr --session team session access
 
 After enabling sharing, open **Space access** from the owner’s native Herdr menu, or run the `session access` command above. The screen lists login accounts, live native connection counts and a space-permission matrix. Use Tab to change columns, arrows or the mouse to select, and Space to cycle No access, View and Control. A Control grant requires an explicit acknowledgement naming the execution account. Press `s` to save the draft, or `q`/Escape to cancel. `/` searches an exact OS account name or UID, including accounts supplied by directory services. `r` removes all grants for the selected user from the draft, including grants to deleted spaces; save to apply. `d` opens confirmation to disable sharing. The owner always has full access.
 
-Unresolved accounts retained in grants appear with an unresolved marker. Review them during account deprovisioning. UID reuse with the same username is not reliably distinguishable on every NSS provider.
+Deleted or invalid accounts lose their grants when account identity is refreshed. Revoke access explicitly during account deprovisioning. UID reuse with the same username is not reliably distinguishable on every NSS provider.
 
 Equivalent explicit grant commands are available:
 
@@ -68,7 +68,7 @@ Text/JSON scoped actions recheck policy under a shared execution lock; saves tak
 
 Data already delivered cannot be recalled. Screenshots, copied text and a malicious client can retain previously delivered content.
 
-Grants persist when the sharing broker restarts against the same live Herdr server. A full Herdr server restart requires enabling sharing again and reassigning grants. Policies are bound to kernel boot ID, server PID and process start time, preventing old grants from applying to reused space IDs. This is a deliberate fail-closed preview limitation. Renaming a live space preserves its grants; deleted-space grants remain visible in the owner grant data and can be removed. Stronger persistent workspace incarnations are tracked as follow-up work.
+Schema-2 grants persist across broker and server restarts. They bind the host and owner account, participant UID/account name, public space ID and a durable workspace incarnation. Renaming preserves grants; deleting a space, replacing its incarnation or invalidating an account prunes stale grants. A new object cannot inherit access merely by reusing a public ID. Old preview policies migrate fail closed and require a one-time explicit regrant. The broker also authenticates the current server runtime independently: an old broker refuses a replacement daemon until the owner disables and re-enables sharing. Valid durable grants then apply without regranting.
 
 Stop sharing without stopping terminals:
 
@@ -84,15 +84,45 @@ When the main server stops or is replaced, the old broker refuses participant op
 
 A stale socket left by a crashed broker is refused rather than overwritten. Verify that no broker is running, inspect that the endpoint is an owner-owned socket in the expected owner-controlled directory, and remove that stale socket through normal host administration before restarting. Never remove an unfamiliar path automatically.
 
-Policy and audit data live under the owner's session directory in `shared-access/`. Policy files and lock files are private. Corrupt policy denies shared access; keep sharing disabled, preserve the corrupt file for inspection, and restore a known-good policy for the same live runtime or explicitly regrant access in a fresh runtime. Do not edit the JSON while the service is running, copy it to another host, or widen file permissions to work around an error.
+Policy and audit data live under the owner's session directory in `shared-access/`. Policy files and lock files are private. Corrupt policy denies shared access; keep sharing disabled, preserve the corrupt file for inspection, and restore a known-good policy for the same host, owner and workspace incarnations, or explicitly regrant access. Do not edit the JSON while the service is running, copy it to another host, or widen file permissions to work around an error.
 
-The broker audit log records bounded JSON operation/UID/outcome/revision data without terminal content or credentials. Native attach/detach/denial audit integration remains follow-up work; terminal keystrokes are intentionally not audited. It rotates by truncating at its size limit; it is diagnostic, not an immutable compliance log.
+The asynchronous audit writer records bounded native and broker attach/detach, denials and policy operations with UID, outcome and revision, without terminal content or credentials. Reserved policy-event queue capacity prevents denial floods from consuming that capacity. Rate limiting and bounded queues may suppress diagnostic events under sustained load; terminal keystrokes are intentionally not audited. The owner-only file rotates by truncating at its size limit. It is diagnostic, not an immutable compliance log.
+
+## Opt-in isolated workers
+
+This Linux mode runs a space's terminals in rootless Bubblewrap namespaces with a writable mount of one configured project. It uses the owner's outer host UID in a separate namespace, **not a separate host account**. The native execution label shows the host account and network policy. Herdr remains unprivileged and requires a trusted, non-setuid system `/usr/bin/bwrap` plus kernel support for unprivileged namespaces. Preflight failure denies configuration or launch; there is no owner-shell fallback.
+
+Migration is offline and restarts every PTY. Stop the named server, then configure the space using its actual ID and an existing canonical project root:
+
+```sh
+herdr --session team server stop
+herdr --session team session worker enable --space w1 --project /srv/project-a --ack-restart
+herdr --session team server
+```
+
+Run the last command in the owner's normal server supervision arrangement, or attach normally to start it. All restored terminals in that space now use the worker profile. Sessions containing isolated spaces use snapshot format 4 to record the execution requirement; ordinary sessions retain format 3. Keep a compatible fork binary for isolated sessions. Missing or invalid profiles fail closed, and unsupported newer snapshots are preserved rather than replaced by an ordinary fallback session. The explicit acknowledgement covers loss of live processes; this does not transfer running owner processes into a namespace. Project roots cannot overlap other configured isolated projects.
+
+Inspect live status with `herdr --session team session worker status`. To return a space to trusted execution, stop the server first and use:
+
+```sh
+herdr --session team session worker disable --space w1 --ack-restart
+```
+
+Restart the server after disabling. Restored terminals will have the owner's normal privileges again; review participant Control grants before doing so.
+
+Workers receive read-only system programs, private HOME/tmp/proc/dev, their selected project, a file-mounted Herdr executable and a token-scoped integration socket. Owner home/state, sibling projects, owner sockets, SSH agents and provider credentials are not inherited. Broker tokens bind the workspace incarnation and current runtime generation; generations rotate on restart. Project-scoped CLI reporting works through the scoped broker; owner/global APIs remain unavailable.
+
+The initial supported mode has **no network**. Host loopback, abstract sockets and outbound provider access are unavailable. Remote AI providers require a separately reviewed network/credential extension and are excluded from this mode. Credentials deliberately stored inside the writable project remain readable by its controllers.
+
+Owner host Git helpers, popups, custom host shell commands and plugin execution are blocked inside isolated spaces. Managed tabs, panes and configured terminal commands use the worker launcher. Moving terminals across the trusted/isolated boundary is rejected. Live sharing or workers block private handoff; disable sharing and return spaces to trusted execution offline before using that handoff path.
+
+The boundary trusts the kernel, host administrator and system binaries. It does not protect against kernel exploits, host administrators, secrets deliberately placed in the project, or CPU/memory/disk exhaustion. Qualification of the actual worker runtime is tracked separately from the phase-one shared-access results; consult the validation record before rollout.
 
 ## Implementation and remaining work
 
 The shared endpoint has its own explicit allowlist. Existing native protocols and frozen codecs are unchanged. `shared.execute.v1` is an owner-private dispatch method; an older server rejects it instead of silently ignoring the workspace checks. Use matching fork binaries on the host.
 
-The PRD and architecture inventory are in `.local/prd/`; Beads tracks implementation and remaining work. Native shared attachment and live connection indicators are implemented. Persisted workspace incarnations, broader structural commands, automatic broker supervision and isolated workers remain separate work. Do not describe the full PRD or isolated execution phase as complete on the basis of this preview.
+The PRD and architecture decision are in `.local/prd/`; Beads tracks acceptance and qualification. Native shared attachment, live connection indicators, durable workspace incarnations, native/broker audit and opt-in isolated execution are implemented. Cross-host shared bridging, broader participant structural commands, automatic broker supervision and worker network/provider provisioning are excluded. Implementation alone does not establish that every release qualification gate has passed.
 
 ## Repeatable qualification
 
@@ -103,3 +133,11 @@ just test-shared-access-linux
 This builds a disposable Linux image with Rust 1.96.1 and checksum-verified Zig 0.16.0, compiles the fork, and runs the real multi-account broker and native-interface qualification. Fixture users are created only inside that container. The Python harness refuses to run on a workstation or without `HERDR_SHARED_TEST_DISPOSABLE=1`; do not mount a host home directory into this test image.
 
 `scripts/test_shared_access_native.py` exercises the normal TUI plus malicious generation-1 endpoint probes. `scripts/test_shared_access_ui.py` adds owner administration and optional `--text` PTY-level screen qualification inside the same explicitly disposable environment after the account fixture exists. Set `HERDR_SHARED_TEST_BINARY` to the built binary when using another container layout. Optional older-server qualification requires `HERDR_SHARED_OLD_BINARY` pointing to an actual baseline executable; a skipped older-binary check is not a compatibility pass.
+
+For actual isolated-worker qualification:
+
+```sh
+just test-isolated-workers-linux
+```
+
+This builds the same disposable image and runs `scripts/test_isolated_workers.py` without host mounts. Its outer Docker process allows nested namespace/procfs creation with `seccomp=unconfined` and `systempaths=unconfined`; the Herdr owner and worker remain unprivileged, with no added host capabilities or Docker socket. These flags qualify the disposable test environment, not a Herdr privilege requirement. The script separately verifies actual scoped execution, integration, lifecycle and escape-denial behavior. Production hosts must pass the rootless preflight independently.

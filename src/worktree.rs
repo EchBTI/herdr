@@ -151,10 +151,16 @@ pub(crate) fn canonical_or_original(path: &Path) -> PathBuf {
     std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
 }
 
-fn repository_git_command(repo_root: &Path, trust_repository: bool) -> std::process::Command {
+fn repository_git_command(
+    repo_root: &Path,
+    trust_repository: bool,
+) -> Result<std::process::Command, String> {
+    if !crate::shared::worker::host_git_path_allowed(repo_root) {
+        return Err("host Git is disabled for isolated projects".into());
+    }
     let mut command = crate::noninteractive_process::command("git");
     command.args(repository_git_args(repo_root, trust_repository));
-    command
+    Ok(command)
 }
 
 fn repository_git_args(repo_root: &Path, trust_repository: bool) -> Vec<String> {
@@ -216,7 +222,7 @@ pub(crate) fn checkout_has_dirty_files(
     path: &Path,
     trust_repository: bool,
 ) -> Result<bool, String> {
-    let output = repository_git_command(path, trust_repository)
+    let output = repository_git_command(path, trust_repository)?
         .args(["status", "--porcelain", "--untracked-files=all"])
         .output()
         .map_err(|err| err.to_string())?;
@@ -282,7 +288,7 @@ fn local_branch_exists(
     branch: &str,
     trust_repository: bool,
 ) -> Result<bool, String> {
-    let output = repository_git_command(repo_root, trust_repository)
+    let output = repository_git_command(repo_root, trust_repository)?
         .args(["show-ref", "--verify", "--quiet"])
         .arg(format!("refs/heads/{branch}"))
         .output()
@@ -322,6 +328,15 @@ pub(crate) fn run_worktree_add_command(
 }
 
 pub(crate) fn run_worktree_command(command: &WorktreeCommand) -> Result<(), String> {
+    if command
+        .args
+        .iter()
+        .map(Path::new)
+        .filter(|path| path.is_absolute())
+        .any(|path| !crate::shared::worker::host_git_path_allowed(path))
+    {
+        return Err("host Git is disabled for isolated projects".into());
+    }
     let output = crate::noninteractive_process::command(&command.program)
         // Removal errors are classified by Git's English diagnostics.
         .env("LC_ALL", "C")
@@ -399,6 +414,7 @@ fn leftover_worktree_checkout_matches_repo(
 
 fn git_common_worktrees_dir(repo_root: &Path, trust_repository: bool) -> Option<PathBuf> {
     let output = repository_git_command(repo_root, trust_repository)
+        .ok()?
         .args(["rev-parse", "--git-common-dir"])
         .output()
         .ok()?;
@@ -497,7 +513,7 @@ pub(crate) fn list_existing_worktrees(
 ) -> Result<Vec<ExistingWorktree>, String> {
     #[cfg(test)]
     test_list_gate::wait(repo_root);
-    let output = repository_git_command(repo_root, trust_repository)
+    let output = repository_git_command(repo_root, trust_repository)?
         .args(["worktree", "list", "--porcelain"])
         .output()
         .map_err(|err| err.to_string())?;

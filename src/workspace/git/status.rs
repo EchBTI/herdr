@@ -102,6 +102,17 @@ pub fn git_status_snapshot_for_cwd_with_demand(
     cached: Option<&GitStatusCacheEntry>,
     demand: GitStatusRefreshDemand,
 ) -> (WorkspaceGitStatusSnapshot, Option<GitStatusCacheEntry>) {
+    if !crate::shared::worker::host_git_path_allowed(cwd) {
+        return (
+            WorkspaceGitStatusSnapshot {
+                auto_label: fallback_label_from_cwd(cwd),
+                branch: None,
+                ahead_behind: None,
+                space: None,
+            },
+            None,
+        );
+    }
     if let Some(cached) = cached.filter(|entry| {
         entry.fingerprint.is_none()
             && entry
@@ -319,6 +330,9 @@ fn git_ahead_behind_between(
     head_oid: &str,
     upstream_oid: &str,
 ) -> Option<(usize, usize)> {
+    if !crate::shared::worker::host_git_path_allowed(cwd) {
+        return None;
+    }
     let range = format!("{head_oid}...{upstream_oid}");
     let output = crate::noninteractive_process::command("git")
         .arg("-C")

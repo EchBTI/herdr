@@ -66,7 +66,7 @@ impl App {
             });
         let split_cwd = params.cwd.map(std::path::PathBuf::from).or_else(|| {
             let follow_cwd = self.launch_cwd_for_pane_in_workspace(ws_idx, target_pane_id);
-            Some(self.resolve_new_terminal_cwd(follow_cwd))
+            Some(self.resolve_new_terminal_cwd_in_workspace(ws_idx, follow_cwd))
         });
         let default_shell = self.state.default_shell.clone();
         let scrollback_limit_bytes = self.state.pane_scrollback_limit_bytes;
@@ -982,6 +982,8 @@ impl App {
             previous_tab_label: self.state.workspaces[source_ws_idx].tabs[source_tab_idx]
                 .custom_name
                 .clone(),
+            previous_incarnation: self.state.workspaces[source_ws_idx].incarnation.clone(),
+            previous_isolated: self.state.workspaces[source_ws_idx].isolated_execution,
             previous_worktree_space: self.state.workspaces[source_ws_idx].worktree_space.clone(),
             identity_cwd: self.state.workspaces[source_ws_idx].identity_cwd.clone(),
         };
@@ -1132,6 +1134,40 @@ impl App {
             }
         };
 
+        // A PTY keeps the execution boundary it was launched with. Moving it
+        // across either side of an isolated workspace would mislabel that PTY
+        // or expose another project's scoped credentials. Check before take.
+        let target_workspace = match &resolved {
+            ResolvedPaneMoveDestination::ExistingTab { tab_id, .. } => {
+                self.parse_tab_id(tab_id).map(|(index, _)| index)
+            }
+            ResolvedPaneMoveDestination::NewTab { workspace_id, .. } => {
+                self.parse_workspace_id(workspace_id)
+            }
+            ResolvedPaneMoveDestination::NewWorkspace { .. } => None,
+        };
+        let crosses_isolation = target_workspace != Some(source_ws_idx)
+            && (self.state.workspaces[source_ws_idx].isolated_execution
+                || target_workspace
+                    .is_some_and(|index| self.state.workspaces[index].isolated_execution));
+        if crosses_isolation {
+            return encode_error(
+                id,
+                "isolated_execution_boundary",
+                "terminals cannot move across an isolated workspace execution boundary",
+            );
+        }
+        let source_isolated = self.state.workspaces[source_ws_idx].isolated_execution;
+        let source_runtime = self.terminal_runtimes.get(&source_terminal_id);
+        if source_runtime.is_some_and(|runtime| runtime.isolated_execution() != source_isolated)
+            || (source_isolated && source_runtime.is_none())
+        {
+            return encode_error(
+                id,
+                "isolated_execution_boundary",
+                "terminal execution identity does not match its workspace",
+            );
+        }
         let previous_focus = self.state.current_pane_focus_target();
         let taken = match self
             .state
@@ -1390,6 +1426,8 @@ impl App {
                 self.render_dirty.clone(),
             );
             workspace.id = context.previous_workspace_id;
+            workspace.incarnation = context.previous_incarnation;
+            workspace.isolated_execution = context.previous_isolated;
             workspace.worktree_space = context.previous_worktree_space;
             let insert_idx = context.source_ws_idx.min(self.state.workspaces.len());
             if let Some(active) = self.state.active {
@@ -2242,6 +2280,8 @@ struct PaneMoveRecoveryContext {
     source_ws_idx: usize,
     previous_workspace_id: String,
     previous_workspace_label: Option<String>,
+    previous_incarnation: String,
+    previous_isolated: bool,
     previous_tab_label: Option<String>,
     previous_worktree_space: Option<crate::workspace::WorktreeSpaceMembership>,
     identity_cwd: std::path::PathBuf,
@@ -3385,6 +3425,154 @@ mod tests {
         );
     }
     #[test]
+    fn isolated_execution_rejects_pane_moves_before_either_workspace_changes() {
+        for isolated_source in [false, true] {
+            for destination_kind in ["tab", "new_tab"] {
+                let mut app = app_with_linked_worktree();
+                app.state.active = Some(0);
+                app.state.selected = 0;
+                app.state.workspaces.push(Workspace::test_new("other"));
+                app.state.workspaces[usize::from(!isolated_source)].isolated_execution = true;
+                seed_terminal_states(&mut app);
+                let pane = app.state.workspaces[0].tabs[0].root_pane;
+                let source = app.public_pane_id(0, pane).unwrap();
+                let destination = if destination_kind == "tab" {
+                    PaneMoveDestination::Tab {
+                        tab_id: app.public_tab_id(1, 0).unwrap(),
+                        target_pane_id: None,
+                        split: SplitDirection::Right,
+                        ratio: None,
+                    }
+                } else {
+                    PaneMoveDestination::NewTab {
+                        workspace_id: Some(app.public_workspace_id(1)),
+                        label: None,
+                    }
+                };
+                let before = app
+                    .state
+                    .workspaces
+                    .iter()
+                    .map(|ws| {
+                        (
+                            ws.id.clone(),
+                            ws.tabs
+                                .iter()
+                                .map(|tab| tab.layout.pane_ids())
+                                .collect::<Vec<_>>(),
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                let active = app.state.active;
+                let selected = app.state.selected;
+                let count = app.state.terminals.len();
+                let response = app.handle_pane_move(
+                    "isolated-move".into(),
+                    PaneMoveParams {
+                        pane_id: source.clone(),
+                        destination,
+                        focus: true,
+                    },
+                );
+                let error: ErrorResponse = serde_json::from_str(&response).unwrap();
+                assert_eq!(error.error.code, "isolated_execution_boundary");
+                let after = app
+                    .state
+                    .workspaces
+                    .iter()
+                    .map(|ws| {
+                        (
+                            ws.id.clone(),
+                            ws.tabs
+                                .iter()
+                                .map(|tab| tab.layout.pane_ids())
+                                .collect::<Vec<_>>(),
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                assert_eq!(before, after);
+                assert_eq!(
+                    (
+                        app.state.active,
+                        app.state.selected,
+                        app.state.terminals.len()
+                    ),
+                    (active, selected, count)
+                );
+                assert_eq!(app.parse_pane_id(&source), Some((0, pane)));
+                app.state.assert_invariants_for_test();
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn isolated_execution_move_requires_the_actual_runtime_marker() {
+        let mut app = app_with_linked_worktree();
+        app.state.active = Some(0);
+        app.state.selected = 0;
+        let source = app.state.workspaces[0].tabs[0].root_pane;
+        let target_tab = app.state.workspaces[0].test_add_tab(None);
+        app.state.workspaces[0].isolated_execution = true;
+        seed_terminal_states(&mut app);
+        let terminal_id = app.state.workspaces[0].tabs[0]
+            .terminal_id(source)
+            .unwrap()
+            .clone();
+        let (runtime, _rx) = crate::terminal::TerminalRuntime::test_with_channel(80, 24);
+        app.terminal_runtimes.insert(terminal_id.clone(), runtime);
+        let destination = PaneMoveDestination::Tab {
+            tab_id: app.public_tab_id(0, target_tab).unwrap(),
+            target_pane_id: None,
+            split: SplitDirection::Right,
+            ratio: None,
+        };
+        let params = PaneMoveParams {
+            pane_id: app.public_pane_id(0, source).unwrap(),
+            destination,
+            focus: false,
+        };
+        let response = app.handle_pane_move("wrong-runtime".into(), params.clone());
+        let error: ErrorResponse = serde_json::from_str(&response).unwrap();
+        assert_eq!(error.error.code, "isolated_execution_boundary");
+        assert!(app.state.workspaces[0].tabs[0].panes.contains_key(&source));
+        let mut runtime = app.terminal_runtimes.remove(&terminal_id).unwrap();
+        runtime.test_mark_isolated();
+        app.terminal_runtimes.insert(terminal_id, runtime);
+        let response = app.handle_pane_move("isolated-runtime".into(), params);
+        let success: SuccessResponse = serde_json::from_str(&response).unwrap();
+        assert!(matches!(success.result, ResponseResult::PaneMove { .. }));
+        assert_eq!(app.state.workspaces.len(), 1);
+        assert!(app.state.workspaces[0].isolated_execution);
+        app.state.assert_invariants_for_test();
+    }
+
+    #[test]
+    fn isolated_execution_pane_cannot_be_promoted_into_a_trusted_new_workspace() {
+        let mut app = app_with_linked_worktree();
+        app.state.active = Some(0);
+        app.state.selected = 0;
+        app.state.workspaces[0].isolated_execution = true;
+        seed_terminal_states(&mut app);
+        let pane = app.state.workspaces[0].tabs[0].root_pane;
+        let response = app.handle_pane_move(
+            "isolated-promote".into(),
+            PaneMoveParams {
+                pane_id: app.public_pane_id(0, pane).unwrap(),
+                destination: PaneMoveDestination::NewWorkspace {
+                    label: None,
+                    tab_label: None,
+                },
+                focus: true,
+            },
+        );
+        let error: ErrorResponse = serde_json::from_str(&response).unwrap();
+        assert_eq!(error.error.code, "isolated_execution_boundary");
+        assert_eq!(app.state.workspaces.len(), 1);
+        assert!(app.state.workspaces[0].tabs[0].panes.contains_key(&pane));
+        app.state.assert_invariants_for_test();
+    }
+
+    #[test]
     fn api_pane_move_to_existing_tab_across_workspace_reassigns_public_pane_id() {
         let mut app = app_with_linked_worktree();
         app.state.workspaces.push(Workspace::test_new("other"));
@@ -3820,6 +4008,8 @@ mod tests {
     #[test]
     fn api_pane_move_recovery_restores_removed_source_workspace() {
         let mut app = app_with_linked_worktree();
+        app.state.workspaces[0].isolated_execution = true;
+        let previous_incarnation = app.state.workspaces[0].incarnation.clone();
         let source = app.state.workspaces[0].tabs[0].root_pane;
         let source_terminal = app.state.workspaces[0].tabs[0]
             .terminal_id(source)
@@ -3831,6 +4021,8 @@ mod tests {
             previous_workspace_id: previous_workspace_id.clone(),
             previous_workspace_label: app.state.workspaces[0].custom_name.clone(),
             previous_tab_label: app.state.workspaces[0].tabs[0].custom_name.clone(),
+            previous_incarnation: app.state.workspaces[0].incarnation.clone(),
+            previous_isolated: app.state.workspaces[0].isolated_execution,
             previous_worktree_space: app.state.workspaces[0].worktree_space.clone(),
             identity_cwd: app.state.workspaces[0].identity_cwd.clone(),
         };
@@ -3843,6 +4035,8 @@ mod tests {
 
         app.recover_failed_pane_move(context, taken.moved);
 
+        assert!(app.state.workspaces[0].isolated_execution);
+        assert_eq!(app.state.workspaces[0].incarnation, previous_incarnation);
         assert_eq!(app.state.workspaces.len(), 1);
         assert_eq!(app.state.workspaces[0].id, previous_workspace_id);
         assert_eq!(

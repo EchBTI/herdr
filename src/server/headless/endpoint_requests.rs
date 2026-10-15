@@ -23,6 +23,7 @@ impl HeadlessServer {
         }
 
         if !self.shared_method_allowed(client_id, &request.method) {
+            self.audit_shared_client(client_id, request.method.operation().name, "denied", None);
             let response = crate::server::client_commands::error_message(
                 boot_id,
                 request_id,

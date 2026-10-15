@@ -182,8 +182,11 @@ fn external_api_burst_profile() {
             }
             first_samples.sort_unstable();
             total_samples.sort_unstable();
-            println!("api-burst panes={pane_count} requests={count} first_count={first_count} first_us={:.3} total_us={:.3}",
-                first_samples[3].as_secs_f64() * 1e6, total_samples[3].as_secs_f64() * 1e6);
+            println!(
+                "api-burst panes={pane_count} requests={count} first_count={first_count} first_us={:.3} total_us={:.3}",
+                first_samples[3].as_secs_f64() * 1e6,
+                total_samples[3].as_secs_f64() * 1e6
+            );
         }
     }
 }

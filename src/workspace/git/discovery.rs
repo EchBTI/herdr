@@ -22,6 +22,9 @@ pub struct GitWorktreeInfo {
 }
 
 pub fn derive_label_from_cwd(cwd: &Path) -> String {
+    if !crate::shared::worker::host_git_path_allowed(cwd) {
+        return fallback_label_from_cwd(cwd);
+    }
     git_repo_root(cwd)
         .map(|repo_root| automatic_workspace_label(cwd, &repo_root))
         .unwrap_or_else(|| fallback_label_from_cwd(cwd))
@@ -43,6 +46,9 @@ pub fn fallback_label_from_cwd(cwd: &Path) -> String {
 }
 
 pub fn git_worktree_info(cwd: &Path) -> Option<GitWorktreeInfo> {
+    if !crate::shared::worker::host_git_path_allowed(cwd) {
+        return None;
+    }
     let repo_root = git_repo_root(cwd)?;
     let git_dir = canonicalize_best_effort_path(&git_dir_for_repo_root(&repo_root)?);
     let git_common_dir = canonicalize_best_effort_path(&git_common_dir_for_git_dir(&git_dir));
@@ -59,6 +65,9 @@ pub fn git_worktree_info(cwd: &Path) -> Option<GitWorktreeInfo> {
 }
 
 pub fn git_space_metadata(cwd: &Path) -> Option<GitSpaceMetadata> {
+    if !crate::shared::worker::host_git_path_allowed(cwd) {
+        return None;
+    }
     let info = git_worktree_info(cwd)?;
     Some(git_space_metadata_from_info(&info))
 }
@@ -184,6 +193,9 @@ pub(super) fn read_git_ref_file(path: &Path) -> Option<String> {
 }
 
 pub fn git_branch(cwd: &Path) -> Option<String> {
+    if !crate::shared::worker::host_git_path_allowed(cwd) {
+        return None;
+    }
     let repo_root = git_repo_root(cwd)?;
     let git_dir = git_dir_for_repo_root(&repo_root)?;
     let git_common_dir = git_common_dir_for_git_dir(&git_dir);
@@ -293,6 +305,9 @@ fn strip_git_config_comment(value: &str) -> &str {
 }
 
 fn git_trimmed_stdout(repo_root: &Path, args: &[&str]) -> Option<String> {
+    if !crate::shared::worker::host_git_path_allowed(repo_root) {
+        return None;
+    }
     let output = crate::noninteractive_process::command("git")
         .arg("-C")
         .arg(repo_root)

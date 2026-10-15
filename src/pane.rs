@@ -139,6 +139,8 @@ fn apply_pane_terminal_env(cmd: &mut CommandBuilder) {
 pub(crate) struct PaneLaunchEnv {
     extra: Vec<(String, String)>,
     identity: PaneLaunchIdentity,
+    workspace_incarnation: Option<String>,
+    isolation_required: bool,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -158,6 +160,8 @@ impl PaneLaunchEnv {
         Self {
             extra,
             identity: PaneLaunchIdentity::Inherit,
+            workspace_incarnation: None,
+            isolation_required: false,
         }
     }
 
@@ -172,6 +176,16 @@ impl PaneLaunchEnv {
             tab_id,
             pane_id,
         };
+        self
+    }
+
+    pub(crate) fn with_workspace_incarnation(mut self, incarnation: String) -> Self {
+        self.workspace_incarnation = Some(incarnation);
+        self
+    }
+
+    pub(crate) fn with_isolation_required(mut self, required: bool) -> Self {
+        self.isolation_required = required;
         self
     }
 
@@ -202,6 +216,14 @@ fn apply_pane_launch_env(cmd: &mut CommandBuilder, launch_env: &PaneLaunchEnv) {
     cmd.env(crate::HERDR_ENV_VAR, crate::HERDR_ENV_VALUE);
     crate::integration::apply_pane_base_env(cmd);
     crate::platform::apply_pane_runtime_marker(cmd);
+    cmd.env_remove("HERDR_ISOLATION_REQUIRED");
+    if launch_env.isolation_required {
+        cmd.env("HERDR_ISOLATION_REQUIRED", "1");
+    }
+    cmd.env_remove("HERDR_WORKSPACE_INCARNATION");
+    if let Some(incarnation) = &launch_env.workspace_incarnation {
+        cmd.env("HERDR_WORKSPACE_INCARNATION", incarnation);
+    }
     match &launch_env.identity {
         PaneLaunchIdentity::Inherit => {}
         PaneLaunchIdentity::Managed {
@@ -227,6 +249,7 @@ struct PendingAgentRelease {
 
 #[derive(Clone, Copy, Default)]
 struct SpawnInitialState<'a> {
+    isolated_execution: bool,
     detected_agent: Option<Agent>,
     history_ansi: Option<&'a str>,
     windows_powershell_prompt_cwd_reporting: bool,
@@ -1498,6 +1521,7 @@ async fn run_terminal_compression_task(
 /// Dropping this aborts async tasks and closes the PTY. An already-running bounded
 /// compression step may finish before releasing its terminal reference.
 pub struct PaneRuntime {
+    isolated_execution: bool,
     pane_id: PaneId,
     terminal: Arc<PaneTerminal>,
     io: PaneRuntimeIo,
@@ -2188,6 +2212,22 @@ fn is_powershell_shell(shell: &str) -> bool {
     )
 }
 
+fn command_worker_path(command: &CommandBuilder, key: &str) -> Option<std::path::PathBuf> {
+    command.get_env(key).map(std::path::PathBuf::from)
+}
+
+/// Validate namespace cwd reports without following host paths or invoking Git.
+fn worker_cwd_is_scoped(cwd: &Path, root: &Path) -> bool {
+    cwd.is_absolute()
+        && cwd.starts_with(root)
+        && !cwd.components().any(|part| {
+            matches!(
+                part,
+                std::path::Component::ParentDir | std::path::Component::CurDir
+            )
+        })
+}
+
 fn usable_reported_cwd(cwd: std::path::PathBuf) -> Option<std::path::PathBuf> {
     (cwd.is_absolute() && cwd.is_dir()).then_some(cwd)
 }
@@ -2231,6 +2271,14 @@ fn publish_reported_cwd(
 }
 
 impl PaneRuntime {
+    pub(crate) fn isolated_execution(&self) -> bool {
+        self.isolated_execution
+    }
+    #[cfg(test)]
+    pub(crate) fn test_mark_isolated(&mut self) {
+        self.isolated_execution = true;
+    }
+
     pub fn shutdown(mut self) {
         if let Some(handle) = self.detect_handle.take() {
             handle.abort();
@@ -2392,6 +2440,7 @@ impl PaneRuntime {
         cmd.cwd(crate::platform::normalize_cwd_for_launch(&cwd));
         apply_pane_terminal_env(&mut cmd);
         apply_pane_launch_env(&mut cmd, launch_env);
+        let (cmd, isolated_execution) = crate::shared::worker::prepare(cmd)?;
         Self::spawn_command_builder(
             pane_id,
             rows,
@@ -2405,6 +2454,7 @@ impl PaneRuntime {
             cmd,
             "failed to spawn shell",
             SpawnInitialState {
+                isolated_execution,
                 detected_agent: None,
                 history_ansi: initial_history_ansi,
                 windows_powershell_prompt_cwd_reporting,
@@ -2434,6 +2484,7 @@ impl PaneRuntime {
         cmd.cwd(crate::platform::normalize_cwd_for_launch(&cwd));
         apply_pane_terminal_env(&mut cmd);
         apply_pane_launch_env(&mut cmd, launch_env);
+        let (cmd, isolated_execution) = crate::shared::worker::prepare(cmd)?;
         Self::spawn_command_builder(
             pane_id,
             rows,
@@ -2446,7 +2497,10 @@ impl PaneRuntime {
             render_dirty,
             cmd,
             "failed to spawn command pane",
-            SpawnInitialState::default(),
+            SpawnInitialState {
+                isolated_execution,
+                ..Default::default()
+            },
             agent_detection,
         )
     }
@@ -2481,6 +2535,7 @@ impl PaneRuntime {
         cmd.cwd(crate::platform::normalize_cwd_for_launch(&cwd));
         apply_pane_terminal_env(&mut cmd);
         apply_pane_launch_env(&mut cmd, launch_env);
+        let (cmd, isolated_execution) = crate::shared::worker::prepare(cmd)?;
         Self::spawn_command_builder(
             pane_id,
             rows,
@@ -2493,7 +2548,10 @@ impl PaneRuntime {
             render_dirty,
             cmd,
             "failed to spawn argv command pane",
-            SpawnInitialState::default(),
+            SpawnInitialState {
+                isolated_execution,
+                ..Default::default()
+            },
             agent_detection,
         )
     }
@@ -2659,6 +2717,7 @@ impl PaneRuntime {
         );
 
         Ok(Self {
+            isolated_execution: false,
             pane_id,
             terminal,
             io,
@@ -2699,15 +2758,25 @@ impl PaneRuntime {
         initial_state: SpawnInitialState<'_>,
         agent_detection: AgentDetection,
     ) -> std::io::Result<Self> {
+        let isolated_execution = initial_state.isolated_execution;
+        let isolated_cwd = isolated_execution
+            .then(|| command_worker_path(&cmd, "HERDR_WORKER_CWD"))
+            .flatten();
+        let isolated_root = isolated_execution
+            .then(|| command_worker_path(&cmd, "HERDR_WORKER_PROJECT_ROOT"))
+            .flatten();
         crate::logging::pane_spawn_started(pane_id.raw(), rows, cols, scrollback_limit_bytes);
 
         let (response_tx, _response_rx) = mpsc::channel::<Bytes>(1);
         let mut terminal = crate::ghostty::Terminal::new(cols, rows, scrollback_limit_bytes)
             .map_err(|e| std::io::Error::other(e.to_string()))?;
         if crate::kitty_graphics::is_enabled() {
-            terminal
-                .enable_kitty_graphics()
-                .map_err(|e| std::io::Error::other(e.to_string()))?;
+            if isolated_execution {
+                terminal.enable_kitty_graphics_inline_only()
+            } else {
+                terminal.enable_kitty_graphics()
+            }
+            .map_err(|e| std::io::Error::other(e.to_string()))?;
         }
         let pane_terminal = GhosttyPaneTerminal::new(terminal, response_tx.clone())?;
         pane_terminal.apply_host_terminal_theme(host_terminal_theme);
@@ -2728,7 +2797,7 @@ impl PaneRuntime {
 
         // --- Child watcher task ---
         let child_pid = Arc::new(AtomicU32::new(0));
-        let reported_cwd = Arc::new(Mutex::new(None));
+        let reported_cwd = Arc::new(Mutex::new(isolated_cwd.clone()));
         let child_wait_completed = Arc::new(AtomicBool::new(false));
         let content_seq = Arc::new(AtomicU64::new(0));
         let detection_content_seq = Arc::new(AtomicU64::new(0));
@@ -2788,8 +2857,20 @@ impl PaneRuntime {
                 };
                 content_seq.fetch_add(1, Ordering::AcqRel);
                 let shell_pid = child_pid.load(Ordering::Acquire);
-                let result =
+                let mut result =
                     terminal.process_pty_bytes(pane_id, shell_pid, bytes, &response_writer);
+                if isolated_execution {
+                    if let Some(cwd) = result.reported_cwd.take().filter(|cwd| {
+                        isolated_root
+                            .as_ref()
+                            .is_some_and(|root| worker_cwd_is_scoped(cwd, root))
+                    }) {
+                        if let Ok(mut known) = reported_cwd.lock() {
+                            *known = Some(cwd);
+                        }
+                    }
+                    result.clipboard_writes.clear();
+                }
                 content_seq.fetch_add(1, Ordering::Release);
                 drop(_content_write_guard);
                 compression_wake.wake();
@@ -3272,13 +3353,14 @@ impl PaneRuntime {
         };
 
         Ok(Self {
+            isolated_execution,
             pane_id,
             terminal,
             io,
             current_size: Cell::new((rows, cols, 0, 0)),
             child_pid,
             reported_cwd,
-            persistence_cwd: Mutex::new(None),
+            persistence_cwd: Mutex::new(isolated_cwd),
             cwd_process_exited: child_wait_completed.clone(),
             child_wait_completed: Some(child_wait_completed),
             kitty_keyboard_flags,
@@ -3814,11 +3896,17 @@ impl PaneRuntime {
             return Some(cwd);
         }
 
+        if self.isolated_execution {
+            return None;
+        }
         let pid = self.child_pid.load(Ordering::Relaxed);
         crate::platform::pane_process_cwd(pid)
     }
 
     pub fn cwd_for_persistence(&self) -> Option<std::path::PathBuf> {
+        if self.isolated_execution {
+            return self.cwd();
+        }
         let pid = self.child_pid.load(Ordering::Acquire);
         let exited = self.cwd_process_exited.load(Ordering::Acquire);
         if let Some(cwd) = (!exited)
@@ -3845,6 +3933,9 @@ impl PaneRuntime {
     }
 
     pub fn follow_cwd(&self) -> Option<std::path::PathBuf> {
+        if self.isolated_execution {
+            return self.cwd();
+        }
         #[cfg(unix)]
         {
             let leader_cwd = self
@@ -3862,6 +3953,9 @@ impl PaneRuntime {
 
     /// Get the current working directory of the process group controlling the pane PTY.
     pub fn foreground_cwd(&self) -> Option<std::path::PathBuf> {
+        if self.isolated_execution {
+            return self.cwd();
+        }
         #[cfg(unix)]
         {
             let pid = self.child_pid.load(Ordering::Acquire);
@@ -4062,6 +4156,7 @@ impl PaneRuntime {
 
         (
             Self {
+                isolated_execution: false,
                 pane_id,
                 terminal,
                 io: PaneRuntimeIo::TestChannel {
@@ -5414,6 +5509,7 @@ mod tests {
         ));
         let compression = TerminalCompressionTask::spawn(pane_id, terminal.clone());
         let runtime = PaneRuntime {
+            isolated_execution: false,
             self_reported_agent_active: Arc::new(AtomicBool::new(false)),
             cwd_process_exited: Arc::new(AtomicBool::new(false)),
             persistence_cwd: Mutex::new(None),
@@ -5454,6 +5550,7 @@ mod tests {
         ));
         let compression = TerminalCompressionTask::spawn(pane_id, terminal.clone());
         let runtime = PaneRuntime {
+            isolated_execution: false,
             self_reported_agent_active: Arc::new(AtomicBool::new(false)),
             cwd_process_exited: Arc::new(AtomicBool::new(false)),
             persistence_cwd: Mutex::new(None),

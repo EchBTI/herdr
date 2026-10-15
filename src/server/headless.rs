@@ -85,6 +85,7 @@ mod retained_surface;
 mod shared_access;
 mod shared_projection;
 mod surface_interest;
+mod worker_access;
 
 // Producers can refill even a bounded channel while it is being drained.
 // Yield to scheduled work and rendering between batches; select! below
@@ -975,6 +976,7 @@ impl HeadlessServer {
     }
 
     fn remove_client(&mut self, client_id: u64) -> bool {
+        self.audit_shared_client(client_id, "detach", "allowed", None);
         self.disconnect_native_graphics(client_id);
         let disconnected_focus = self
             .clients
@@ -1233,6 +1235,9 @@ impl HeadlessServer {
                 else {
                     return false;
                 };
+                if !self.shared_pane_execution_allowed(workspace_index, runtime_pane_id) {
+                    return false;
+                }
                 let popup_blocks_input = self.app.state.popup_pane.is_some()
                     && self.popup_owner_tab_id == self.shell_tab_id_for_client(client_id);
                 if popup_blocks_input
@@ -1243,6 +1248,7 @@ impl HeadlessServer {
                 let foreground_changed = self.promote_client_to_foreground(client_id);
                 let geometry_changed = self.claim_shell_tab_geometry(client_id, false);
                 if !self.shared_can_control(client_id, workspace_index) {
+                    self.audit_shared_client(client_id, "terminal.input", "denied", None);
                     return false;
                 }
                 let Some(runtime) = self.app.state.runtime_for_pane_in_workspace(
@@ -1905,6 +1911,9 @@ impl HeadlessServer {
             _ => None,
         };
         if direct_client.is_some_and(|id| self.shared_is_participant(id)) {
+            if let Some(id) = direct_client {
+                self.audit_shared_client(id, "terminal.direct", "denied", None);
+            }
             return false;
         }
         if self.handoff_in_progress && Self::ignore_client_event_during_handoff(&ev) {
@@ -2042,6 +2051,7 @@ impl HeadlessServer {
                     .enable_surface_scroll(surface_scroll);
                 connection.shell_projection_revision = 1;
                 self.clients.insert(client_id, connection);
+                self.audit_shared_client(client_id, "attach", "allowed", None);
                 let config_diagnostic = if self.shared_is_participant(client_id) {
                     None
                 } else if endpoint_keybindings {
@@ -2106,6 +2116,9 @@ impl HeadlessServer {
                     connection.shell_agent_view = agent_view;
                 }
                 if let Some(message) = self.shared_access_message(client_id) {
+                    self.send_to_client(client_id, message);
+                }
+                if let Some(message) = self.worker_execution_message(client_id) {
                     self.send_to_client(client_id, message);
                 }
                 if self.app.state.popup_pane.is_some() && self.popup_owner_tab_id.is_none() {
@@ -2241,6 +2254,7 @@ impl HeadlessServer {
                         _ => false,
                     };
                     if !allowed {
+                        self.audit_shared_client(client_id, "clipboard.upload", "denied", None);
                         return false;
                     }
                 }
@@ -2502,6 +2516,10 @@ impl HeadlessServer {
                     return false;
                 };
                 if !self.shared_can_control(client_id, workspace_index) {
+                    self.audit_shared_client(client_id, "terminal.input", "denied", None);
+                    return false;
+                }
+                if !self.shared_pane_execution_allowed(workspace_index, runtime_pane_id) {
                     return false;
                 }
                 let Some(runtime) = self.app.state.runtime_for_pane_in_workspace(
@@ -2680,6 +2698,12 @@ impl HeadlessServer {
                 code,
                 message,
             } => {
+                self.audit_shared_client(
+                    client_id,
+                    "endpoint.invalid_or_unsupported",
+                    "denied",
+                    None,
+                );
                 let Some(client) = self.clients.get(&client_id) else {
                     return false;
                 };
@@ -3082,8 +3106,16 @@ impl HeadlessServer {
 
         let metadata_expired = self.app.expire_due_metadata(Instant::now());
         if let api::schema::Method::ServerLiveHandoff(params) = &msg.request.method {
-            if self.native_shared.is_some() {
-                let _=msg.respond_to.send(serde_json::json!({"id":msg.request.id,"error":{"code":"sharing_active","message":"disable session sharing before live handoff"}}).to_string());
+            if self.native_shared.is_some()
+                || crate::shared::worker::has_active_workers()
+                || self
+                    .app
+                    .state
+                    .workspaces
+                    .iter()
+                    .any(|workspace| workspace.isolated_execution)
+            {
+                let _=msg.respond_to.send(serde_json::json!({"id":msg.request.id,"error":{"code":"sharing_active","message":"disable session sharing and isolated workspace execution before live handoff"}}).to_string());
                 return false;
             }
             let handoff_result = self.perform_live_handoff(params.clone());
@@ -3167,6 +3199,9 @@ impl HeadlessServer {
             .native_client_id
             .is_some_and(|id| !self.shared_method_allowed(id, &msg.request.method))
         {
+            if let Some(id) = msg.native_client_id {
+                self.audit_shared_client(id, msg.request.method.operation().name, "denied", None);
+            }
             let _=msg.respond_to.send(serde_json::json!({"id":msg.request.id,"error":{"code":"unavailable","message":"object unavailable or access denied"}}).to_string());
             return changed;
         }

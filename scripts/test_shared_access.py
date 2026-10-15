@@ -7,7 +7,7 @@ run with host account/config directories mounted. No credentials are required.
 Optional HERDR_SHARED_OLD_BINARY supplies a real older debug binary; that
 compatibility scenario is explicitly reported as skipped when absent.
 """
-import grp, json, os, pwd, socket, subprocess, sys, time, pathlib
+import grp, json, os, pwd, socket, subprocess, sys, time, pathlib, re, secrets
 
 
 BIN=os.environ.get('HERDR_SHARED_TEST_BINARY','/target/debug/herdr')
@@ -151,6 +151,10 @@ def main():
         for user,space,role in [('alice',alice,'control'),('bob',bob,'control'),('alice',shared,'view'),('bob',shared,'view')]:
             args=['--session',SESSION,'session','access','--user',user,'--space',space,'--role',role,'--ack-owner-execution']
             cli(OWNER,*args)
+        bound_grants=result(OWNER,'grants.get')
+        check(all(re.fullmatch(r'wi_[0-9a-f]{32}',g.get('workspace_incarnation','')) for g in bound_grants['grants']),'owner grants bind server-authored durable workspace incarnations')
+        policy_path=pathlib.Path('/home/owner/.config/herdr-dev/sessions/'+SESSION+'/shared-access/durable-v2/access-policy.json')
+        check(json.loads(policy_path.read_text())['schema_version']==2,'durable policy uses schema two in its separate store')
         for uid,own,forbidden in [(1001,'ALICE_SENTINEL_PRIVATE','BOB_SENTINEL_PRIVATE'),(1002,'BOB_SENTINEL_PRIVATE','ALICE_SENTINEL_PRIVATE')]:
             spaces=result(uid,'spaces')
             raw=json.dumps(spaces)
@@ -181,7 +185,13 @@ def main():
         check('result' in request(1001,'read',dict(pane_id=panes[alice])),'Control can close an extra pane while retaining its space')
         result(OWNER,'workspace.rename',dict(workspace_id=alice,label='ALICE_RENAMED_SENTINEL'),private=True)
         check('ALICE_RENAMED_SENTINEL' in json.dumps(result(1001,'spaces')),'owner rename preserves the stable space grant')
+        before_delete_revision=result(OWNER,'grants.get')['revision']
         result(OWNER,'workspace.close',dict(workspace_id=bob),private=True)
+        for _ in range(100):
+            pruned=result(OWNER,'grants.get')
+            if not any(g['workspace_id']==bob for g in pruned['grants']):break
+            time.sleep(.05)
+        check(not any(g['workspace_id']==bob for g in pruned['grants']) and pruned['revision']>before_delete_revision,'deleting a workspace prunes stale grants and advances the policy revision')
         result(OWNER,'workspace.create',dict(label='BOB_SENTINEL_PRIVATE',cwd='/home/owner'),private=True)
         check('BOB_SENTINEL_PRIVATE' not in json.dumps(result(1002,'spaces')),'delete then recreate same label never resurrects grants')
         cli(OWNER,'--session',SESSION,'session','access','--user','alice','--space',alice,'--role','none','--ack-owner-execution')
@@ -207,7 +217,33 @@ def main():
         cli(OWNER,'--session',SESSION,'session','share','disable')
         check(not os.path.exists(SHARED),'owner can disable broker bound to stale native runtime')
         cli(OWNER,'--session',SESSION,'session','share','enable','--group','herdr-test')
-        check(result(1001,'spaces')['workspaces']==[],'new native runtime starts without imported host runtime grants')
+        check('SHARED_VIEW_SENTINEL' in json.dumps(result(1001,'spaces')),'daemon restart preserves grants for the same durable workspace incarnation')
+        persisted_grant=next(g for g in result(OWNER,'grants.get')['grants'] if g['uid']==1001 and g['workspace_id']==shared)
+        original_grant=next(g for g in bound_grants['grants'] if g['uid']==1001 and g['workspace_id']==shared)
+        check(persisted_grant==original_grant,'restart preserves UID/account/space/incarnation/role binding without regranting')
+        cli(OWNER,'--session',SESSION,'server','stop')
+        server.wait(timeout=10)
+        cli(OWNER,'--session',SESSION,'session','share','disable')
+        # Simulate allocator reuse in the saved fixture: replace an object with
+        # the same public ID but a genuinely new durable incarnation. Existing
+        # policy is deliberately retained so this exercises identity binding.
+        snapshot_path=pathlib.Path('/home/owner/.config/herdr-dev/sessions/'+SESSION+'/session.json')
+        saved=json.loads(snapshot_path.read_text())
+        replacement=next(w for w in saved['workspaces'] if w['id']==shared)
+        replacement['incarnation']='wi_'+secrets.token_hex(16)
+        replacement['custom_name']='REPLACEMENT_SAME_PUBLIC_ID'
+        snapshot_path.write_text(json.dumps(saved))
+        server=subprocess.Popen([BIN,'--session',SESSION,'server'],preexec_fn=identity(OWNER),env=env(OWNER),stdout=log,stderr=log)
+        wait(PRIVATE)
+        cli(OWNER,'--session',SESSION,'session','share','enable','--group','herdr-test')
+        check(result(1001,'spaces')['workspaces']==[] and result(1002,'spaces')['workspaces']==[],'replacement with reused public ID and new incarnation inherits no grants')
+        live_grants=result(OWNER,'grants.get')
+        check(not any(g['workspace_id']==shared for g in live_grants['grants']),'restart prunes grants bound to a replaced durable incarnation')
+        stale_replay=request(OWNER,'grants.set',dict(expected_revision=live_grants['revision'],grants=[persisted_grant],acknowledge_owner_execution=False))
+        check('error' in stale_replay,'owner cannot accidentally replay a retired incarnation grant against a replacement space')
+        cli(OWNER,'--session',SESSION,'session','access','--user','alice','--space',shared,'--role','view')
+        replacement_grant=next(g for g in result(OWNER,'grants.get')['grants'] if g['uid']==1001 and g['workspace_id']==shared)
+        check(replacement_grant['workspace_incarnation']==replacement['incarnation'] and replacement_grant['workspace_incarnation']!=persisted_grant['workspace_incarnation'],'explicit regrant binds the replacement incarnation')
         cli(OWNER,'--session',SESSION,'session','share','disable')
         qualify_old_native()
         print(json.dumps(dict(passed=len(RESULTS),checks=RESULTS,skipped=SKIPPED),indent=2))

@@ -5,7 +5,7 @@ use std::collections::HashSet;
 use std::fmt;
 use std::path::{Path, PathBuf};
 
-const SCHEMA_VERSION: u32 = 1;
+const SCHEMA_VERSION: u32 = 2;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Caller {
@@ -49,6 +49,8 @@ pub(crate) struct Grant {
     pub uid: u32,
     pub account_name: String,
     pub workspace_id: String,
+    #[serde(default)]
+    pub workspace_incarnation: String,
     pub role: Role,
 }
 
@@ -107,7 +109,7 @@ impl AccessPolicy {
         &self,
         caller: &Caller,
         action: Action,
-        workspace: Option<&str>,
+        workspace: Option<(&str, &str)>,
     ) -> bool {
         if self.is_owner(caller) {
             return true;
@@ -115,13 +117,15 @@ impl AccessPolicy {
         if matches!(action, Action::OwnerOnly | Action::Unknown) {
             return false;
         }
-        let Some(workspace) = workspace else {
+        let Some((workspace, incarnation)) = workspace else {
             return false;
         };
         self.grants.iter().any(|grant| {
             grant.uid == caller.uid
                 && caller.account_name() == Some(grant.account_name.as_str())
                 && grant.workspace_id == workspace
+                && crate::workspace::valid_workspace_incarnation(incarnation)
+                && grant.workspace_incarnation == incarnation
                 && (action == Action::Read || grant.role == Role::Control)
         })
     }
@@ -167,6 +171,31 @@ impl AccessPolicy {
         Ok(next)
     }
 
+    /// Drop deleted, replaced and ambiguous workspace grants before publishing
+    /// a topology update. The caller persists a candidate and revokes queues.
+    pub(crate) fn retain_workspaces(
+        &self,
+        caller: &Caller,
+        expected_revision: u64,
+        workspaces: &std::collections::HashMap<String, String>,
+    ) -> Result<Option<Self>, PolicyError> {
+        self.check_edit(caller, expected_revision)?;
+        let mut next = self.clone();
+        next.grants.retain(|grant| {
+            workspaces
+                .get(&grant.workspace_id)
+                .is_some_and(|incarnation| {
+                    incarnation == &grant.workspace_incarnation
+                        && crate::workspace::valid_workspace_incarnation(incarnation)
+                })
+        });
+        if next.grants == self.grants {
+            return Ok(None);
+        }
+        next.revision = self.next_revision()?;
+        Ok(Some(next))
+    }
+
     fn check_edit(&self, caller: &Caller, expected_revision: u64) -> Result<(), PolicyError> {
         if !self.is_owner(caller) {
             return Err(PolicyError::Denied);
@@ -191,6 +220,7 @@ impl AccessPolicy {
             if grant.uid == self.owner_uid
                 || grant.account_name.trim().is_empty()
                 || grant.workspace_id.trim().is_empty()
+                || !crate::workspace::valid_workspace_incarnation(&grant.workspace_incarnation)
                 || !keys.insert((grant.uid, grant.workspace_id.as_str()))
             {
                 return Err(PolicyError::InvalidPolicy);
@@ -203,6 +233,24 @@ impl AccessPolicy {
         }
         Ok(())
     }
+}
+
+/// Stable host + current owner account binding. A copied policy, renamed owner,
+/// or reused owner UID cannot silently inherit the previous owner's grants.
+pub(crate) fn policy_host_identity() -> std::io::Result<String> {
+    let uid = crate::platform::effective_uid()?;
+    let account = crate::platform::os_account_by_uid(uid)?.ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "owner account unavailable",
+        )
+    })?;
+    Ok(format!(
+        "{}:{}:{}",
+        crate::platform::host_identity()?,
+        uid,
+        account.name
+    ))
 }
 
 /// The directory belongs to the owner and must be outside the shared endpoint

@@ -8,11 +8,13 @@ use std::time::{Duration, Instant};
 use clap::{Arg, ArgAction, Command as Cli};
 use serde_json::{json, Value};
 
+pub(crate) mod audit;
 pub(crate) mod broker;
 pub(crate) mod native;
 pub(crate) mod native_transport;
 pub(crate) mod scope;
 mod ui;
+pub(crate) mod worker;
 
 const HELP: &str = "Shared sessions use verified Linux OS accounts. Control delegates the terminal owner's execution privileges. Use View for observers. Native private sockets remain owner-only.";
 
@@ -30,6 +32,31 @@ fn session_arg() -> Arg {
 fn parser() -> Cli {
     Cli::new("herdr").about(HELP).arg(session_arg()).subcommand(
         Cli::new("session")
+            .subcommand(
+                Cli::new("worker")
+                    .subcommand(Cli::new("status"))
+                    .subcommand(
+                        Cli::new("enable")
+                            .arg(Arg::new("space").long("space").required(true))
+                            .arg(Arg::new("project").long("project").required(true))
+                            .arg(
+                                Arg::new("ack-restart")
+                                    .long("ack-restart")
+                                    .required(true)
+                                    .action(ArgAction::SetTrue),
+                            ),
+                    )
+                    .subcommand(
+                        Cli::new("disable")
+                            .arg(Arg::new("space").long("space").required(true))
+                            .arg(
+                                Arg::new("ack-restart")
+                                    .long("ack-restart")
+                                    .required(true)
+                                    .action(ArgAction::SetTrue),
+                            ),
+                    ),
+            )
             .subcommand(
                 Cli::new("share")
                     .subcommand(
@@ -89,7 +116,7 @@ pub(crate) fn maybe_run(args: &[String]) -> Option<io::Result<()>> {
     }
     let relevant = args.get(command).is_some_and(|arg| arg == "session")
         && match args.get(command + 1).map(String::as_str) {
-            Some("share" | "access") => true,
+            Some("share" | "access" | "worker") => true,
             Some("attach") => args[command + 2..]
                 .iter()
                 .any(|arg| arg == "--shared-owner" || arg.starts_with("--shared-owner=")),
@@ -136,6 +163,27 @@ fn run(args: &[String]) -> io::Result<()> {
     let (command, options) = session
         .subcommand()
         .ok_or_else(|| invalid("expected share, access or attach"))?;
+    if command == "worker" {
+        let (action, params) = options
+            .subcommand()
+            .ok_or_else(|| invalid("expected enable, disable or status"))?;
+        return if action == "status" {
+            print_json(&native::control(
+                &crate::api::socket_path(),
+                native::NativeCommand::WorkerStatus,
+            )?)
+        } else {
+            let space = params
+                .get_one::<String>("space")
+                .ok_or_else(|| invalid("missing workspace"))?;
+            let project = if action == "enable" {
+                params.get_one::<String>("project").map(Path::new)
+            } else {
+                None
+            };
+            print_json(&worker::configure(space, project)?)
+        };
+    }
     if command == "attach" {
         let owner_name = options
             .get_one::<String>("owner")

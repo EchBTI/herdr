@@ -3,7 +3,7 @@
 # docker run --rm -e HERDR_SHARED_TEST_DISPOSABLE=1 herdr-shared-test
 FROM rust:1.96.1-bookworm
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    ca-certificates curl xz-utils pkg-config clang python3 procps \
+    ca-certificates curl xz-utils pkg-config clang python3 procps bubblewrap git \
     && rm -rf /var/lib/apt/lists/*
 # Zig archive checksums verified against https://ziglang.org/download/index.json
 # Version and architecture are explicit; never accept an unverified archive.

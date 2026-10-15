@@ -151,7 +151,7 @@ impl App {
                     id,
                     "pane_not_found",
                     format!("pane {target_pane_id} not found"),
-                )
+                );
             }
         };
         if params.focus || placement == PluginPanePlacement::Zoomed {

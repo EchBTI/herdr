@@ -227,6 +227,7 @@ def main():
             screen.close()
             check(rpc("grants.get")["grants"] == [], "cancel discards drafted View grant")
 
+            before_view_revision=rpc("grants.get")["revision"]
             screen = admin_alice()
             screen.send(b" ")
             screen.send(b" ")
@@ -237,6 +238,8 @@ def main():
             screen.close()
             grants = rpc("grants.get")["grants"]
             check(len(grants) == 1 and grants[0]["role"] == "view", "declining Control saves only View")
+            check(rpc("grants.get")["revision"]>before_view_revision and grants[0].get("workspace_incarnation", "").startswith("wi_"),"owner UI save advances revision and binds the durable workspace incarnation")
+            view_incarnation=grants[0]["workspace_incarnation"]
 
             screen = admin_alice()
             screen.send(b" ")
@@ -246,6 +249,7 @@ def main():
             screen.close()
             grants = rpc("grants.get")["grants"]
             check(len(grants) == 1 and grants[0]["role"] == "control", "acknowledged Control saves through the administration screen")
+            check(grants[0]["workspace_incarnation"]==view_incarnation,"owner UI role change preserves the server-authored durable object identity")
 
             rpc("pane.send_text", dict(pane_id=pane, text="printf 'UI_OUTPUT_SENTINEL\\n'\n"), native=True)
             alice = Screen("alice", "session", "attach", "--text", "--shared-owner", "owner", "--shared-session", session)
@@ -264,12 +268,14 @@ def main():
             check("ALICE_UI_ALLOWED" not in bob.data.decode(errors="replace"), "ungranted participant PTY displays empty state")
             bob.close()
 
+            before_revoke_revision=rpc("grants.get")["revision"]
             screen = admin_alice()
             screen.send(b"r")
             screen.wait("All grants for this user removed")
             screen.send(b"s")
             screen.close()
             check(rpc("grants.get")["grants"] == [], "revoke-user screen action persists removal of all grants")
+            check(rpc("grants.get")["revision"]>before_revoke_revision,"owner UI revocation acknowledgement publishes a newer policy revision")
             alice.wait("No spaces have been shared")
             visible = terminal_text(alice.data)
             check("UI_OUTPUT_SENTINEL" not in visible and "ALICE_UI_ALLOWED" not in visible,

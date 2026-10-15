@@ -36,6 +36,7 @@ fn fixture(
                 uid: 1001,
                 account_name: "reader".into(),
                 workspace_id: server.app.state.workspaces[1].id.clone(),
+                workspace_incarnation: server.app.state.workspaces[1].incarnation.clone(),
                 role,
             }],
             true,
@@ -129,12 +130,14 @@ async fn native_shared_projection_and_render_never_use_hidden_fallback() {
     };
     assert!(!frame_text(&surface.frame).contains("SECRET"));
     assert!(frame_text(&surface.frame).contains("VISIBLE_OUTPUT"));
-    assert!(surface.panes.iter().all(|pane| server
-        .app
-        .parse_pane_id(&pane.pane_id)
-        .expect("public pane")
-        .0
-        == 1));
+    assert!(surface.panes.iter().all(|pane| {
+        server
+            .app
+            .parse_pane_id(&pane.pane_id)
+            .expect("public pane")
+            .0
+            == 1
+    }));
     shutdown_test_runtimes(&mut server);
 }
 
@@ -409,5 +412,125 @@ async fn native_shared_bootstrap_cannot_adopt_hidden_owner_popup() {
     let surface = recv_pane_surface(&render, "shared bootstrap surface");
     assert!(surface.popup.is_none());
     assert!(!frame_text(&surface.frame).contains("SECRET"));
+    shutdown_test_runtimes(&mut server);
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "current_thread")]
+async fn native_revoke_barrier_discards_all_lanes_and_rejects_queued_commands() {
+    let (mut server, _control, _render) = fixture(Role::Control);
+    let writer = crate::server::client_transport::ClientWriter::test_paused();
+    writer.control.send(b"OLD_CONTROL".to_vec()).unwrap();
+    writer.render.try_send(b"OLD_OUTPUT".to_vec()).unwrap();
+    writer.render.send_ordered(b"OLD_ORDERED".to_vec()).unwrap();
+    server.clients.get_mut(&7).unwrap().writer = Some(writer.clone());
+    server.claim_shell_tab_geometry(7, false);
+    let before = server.app.state.workspaces[1].tabs[0].panes.len();
+    let target = server
+        .app
+        .public_pane_id(1, server.app.state.workspaces[1].tabs[0].root_pane)
+        .unwrap();
+    server.revoke_native_shared_client(7);
+    assert!(!server.clients.contains_key(&7));
+    assert!(!server.tab_geometry_controllers.values().any(|id| *id == 7));
+    assert!(writer.test_drain().is_empty());
+    assert!(writer.control.send(b"LATE_OUTPUT".to_vec()).is_err());
+    let request = serde_json::from_value(serde_json::json!({"id":"queued-before-revoke","method":"pane.split","params":{"target_pane_id":target,"direction":"right"}})).unwrap();
+    server.handle_client_shell_endpoint_request(
+        7,
+        server.client_shell_boot_id.clone(),
+        Box::new(request),
+    );
+    assert_eq!(server.app.state.workspaces[1].tabs[0].panes.len(), before);
+    shutdown_test_runtimes(&mut server);
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "current_thread")]
+async fn native_policy_commit_saves_and_revokes_before_queued_input_drain() {
+    use std::os::unix::fs::PermissionsExt;
+    let (mut server, _control, _render) = fixture(Role::Control);
+    let owner_uid = crate::platform::effective_uid().unwrap();
+    let owner = Caller::verified(owner_uid, None);
+    let old = AccessPolicy::new(owner_uid, "projection-test-host".into())
+        .unwrap()
+        .replace_grants(
+            &owner,
+            0,
+            vec![Grant {
+                uid: if owner_uid == 1001 { 1002 } else { 1001 },
+                account_name: "reader".into(),
+                workspace_id: server.app.state.workspaces[1].id.clone(),
+                workspace_incarnation: server.app.state.workspaces[1].incarnation.clone(),
+                role: Role::Control,
+            }],
+            true,
+        )
+        .unwrap();
+    server.replace_test_native_shared_policy(old.clone());
+    let directory = server.client_socket_path.parent().unwrap().to_owned();
+    std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let store =
+        crate::access::PolicyStore::new(&directory, owner_uid, "projection-test-host".into());
+    store.save(&old).unwrap();
+    let writer = crate::server::client_transport::ClientWriter::test_paused();
+    writer.control.send(b"OLD_POLICY_OUTPUT".to_vec()).unwrap();
+    server.clients.get_mut(&7).unwrap().writer = Some(writer.clone());
+    let before = server.app.state.workspaces[1].tabs[0].panes.len();
+    let pane = server
+        .app
+        .public_pane_id(1, server.app.state.workspaces[1].tabs[0].root_pane)
+        .unwrap();
+    let request = serde_json::from_value(serde_json::json!({"id":"queued","method":"pane.split","params":{"target_pane_id":pane,"direction":"right"}})).unwrap();
+    server
+        .server_event_tx
+        .try_send(ServerEvent::ClientShellEndpointRequest {
+            client_id: 7,
+            boot_id: server.client_shell_boot_id.clone(),
+            request: Box::new(request),
+        })
+        .unwrap();
+    let next = old.replace_grants(&owner, 1, vec![], true).unwrap();
+    let response = server
+        .handle_native_shared_command(crate::shared::native::NativeCommand::CommitPolicy {
+            policy: Box::new(next),
+        })
+        .unwrap();
+    assert_eq!(response["revision"], 2);
+    assert_eq!(store.load().unwrap().revision(), 2);
+    assert!(!server.clients.contains_key(&7));
+    assert!(writer.test_drain().is_empty());
+    server.drain_server_events();
+    assert_eq!(server.app.state.workspaces[1].tabs[0].panes.len(), before);
+    shutdown_test_runtimes(&mut server);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn native_shared_isolated_workspace_rejects_trusted_runtime_input() {
+    let (mut server, _control, _render) = fixture(Role::Control);
+    let pane_id = server.app.state.workspaces[1].tabs[0].root_pane;
+    let (runtime, mut input) =
+        crate::terminal::TerminalRuntime::test_with_channel_and_scrollback_bytes(
+            80, 24, 1000, b"trusted", 4,
+        );
+    server.app.state.workspaces[1].insert_test_runtime(pane_id, runtime);
+    server.app.state.workspaces[1].isolated_execution = true;
+    let public_id = server.app.public_pane_id(1, pane_id).expect("public pane");
+    assert!(!server.shared_pane_execution_allowed(1, pane_id));
+    let method = api::schema::Method::PaneSendText(api::schema::PaneSendTextParams {
+        pane_id: public_id.clone(),
+        text: "must not execute".into(),
+    });
+    assert!(!server.shared_method_allowed(7, &method));
+    assert!(
+        !server.handle_server_event(ServerEvent::ClientShellPaneInput {
+            client_id: 7,
+            pane_id: public_id,
+            events: vec![crate::protocol::ClientPaneInputEvent::TextCommit(
+                "must not execute".into()
+            )],
+        })
+    );
+    assert!(input.try_recv().is_err());
     shutdown_test_runtimes(&mut server);
 }

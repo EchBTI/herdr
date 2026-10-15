@@ -177,6 +177,37 @@ fn read_server_shutdown_reason(bytes: Vec<u8>) -> Option<String> {
 }
 
 #[test]
+fn isolated_workspace_required_flag_blocks_handoff_without_runtime_or_registry() {
+    let mut server = test_headless_server();
+    let mut workspace = crate::workspace::Workspace::test_new("required-isolation");
+    workspace.isolated_execution = true;
+    server.app.state.workspaces = vec![workspace];
+    server.app.state.active = Some(0);
+    assert!(server.native_shared.is_none());
+    assert_eq!(server.app.terminal_runtimes.len(), 0);
+    let (respond_to, response) = std::sync::mpsc::channel();
+    let changed = server.handle_api_request_with_shutdown_check(api::ApiRequestMessage {
+        native_shared: None,
+        native_client_id: None,
+        shared_scope: None,
+        response_write_complete: None,
+        request: api::schema::Request {
+            id: "required-isolation-handoff".into(),
+            method: api::schema::Method::ServerLiveHandoff(api::schema::ServerLiveHandoffParams {
+                import_exe: Some("/must-not-launch-herdr-handoff".into()),
+                ..Default::default()
+            }),
+        },
+        respond_to,
+    });
+    assert!(!changed);
+    let response: serde_json::Value = serde_json::from_str(&response.recv().unwrap()).unwrap();
+    assert_eq!(response["error"]["code"], "sharing_active");
+    assert!(!server.handoff_in_progress);
+    assert!(!server.shutting_down);
+}
+
+#[test]
 fn completed_handoff_disables_only_old_server_session_persistence() {
     let mut server = test_headless_server();
     server.app.policy = crate::app::AppPolicy::PRODUCTION;
@@ -4284,14 +4315,14 @@ fn explicit_agent_history_read_requires_idle_on_alternate_screen() {
             };
 
             assert_eq!(
-                    server.agent_read_not_idle_error(&request),
-                    Some(api::schema::ErrorBody {
-                        code: "agent_not_idle".into(),
-                        message: format!(
-                            "cannot read 200 lines while {public_pane_id} is working: its alternate-screen history can only be captured by scrolling while idle. Wait and retry, or use --source visible"
-                        ),
-                    })
-                );
+                server.agent_read_not_idle_error(&request),
+                Some(api::schema::ErrorBody {
+                    code: "agent_not_idle".into(),
+                    message: format!(
+                        "cannot read 200 lines while {public_pane_id} is working: its alternate-screen history can only be captured by scrolling while idle. Wait and retry, or use --source visible"
+                    ),
+                })
+            );
 
             let mut default_request = request.clone();
             let api::schema::Method::AgentRead(params) = &mut default_request.method else {
@@ -4634,11 +4665,11 @@ fn terminal_control_rejects_attach_during_alt_screen_read() {
             .contains_key(&terminal_id_string));
         let reason = read_server_shutdown_reason(control_rx.recv().expect("shutdown message"));
         assert_eq!(
-                reason,
-                Some(format!(
-                    "terminal attach failed: terminal {terminal_id_string} has a read in progress; retry"
-                ))
-            );
+            reason,
+            Some(format!(
+                "terminal attach failed: terminal {terminal_id_string} has a read in progress; retry"
+            ))
+        );
     });
 }
 

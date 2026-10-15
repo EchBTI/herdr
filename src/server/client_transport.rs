@@ -702,13 +702,51 @@ pub(crate) fn handle_client_handshake(
     handle_client_handshake_with_auth(stream, client_id, server_event_tx, should_quit, None)
 }
 
+struct SharedHandshakeAudit {
+    principal: Option<(u32, u64)>,
+    audit: Option<Arc<crate::shared::audit::Audit>>,
+}
+impl Drop for SharedHandshakeAudit {
+    fn drop(&mut self) {
+        if let (Some((uid, revision)), Some(audit)) = (self.principal, &self.audit) {
+            audit.record(uid, revision, "attach", "denied", None);
+        }
+    }
+}
+
 pub(crate) fn handle_client_handshake_with_auth(
-    mut stream: LocalStream,
+    stream: LocalStream,
     client_id: u64,
     server_event_tx: &mpsc::Sender<ServerEvent>,
     should_quit: &Arc<AtomicBool>,
     auth: Option<crate::shared::native_transport::NativePrincipal>,
 ) -> io::Result<()> {
+    handle_client_handshake_with_auth_and_audit(
+        stream,
+        client_id,
+        server_event_tx,
+        should_quit,
+        auth,
+        None,
+    )
+}
+
+/// The shared acceptor supplies a bounded audit queue. Every return before a
+/// successful welcome records only the kernel-authenticated principal metadata.
+pub(crate) fn handle_client_handshake_with_auth_and_audit(
+    mut stream: LocalStream,
+    client_id: u64,
+    server_event_tx: &mpsc::Sender<ServerEvent>,
+    should_quit: &Arc<AtomicBool>,
+    auth: Option<crate::shared::native_transport::NativePrincipal>,
+    audit: Option<Arc<crate::shared::audit::Audit>>,
+) -> io::Result<()> {
+    let mut denied = SharedHandshakeAudit {
+        principal: auth
+            .as_ref()
+            .map(|auth| (auth.caller.uid(), auth.policy_revision)),
+        audit,
+    };
     if should_quit.load(Ordering::Acquire) {
         return Ok(());
     }
@@ -903,6 +941,7 @@ pub(crate) fn handle_client_handshake_with_auth(
         }
     };
     protocol::write_message(&mut stream, &welcome).map_err(|e| io::Error::other(e.to_string()))?;
+    denied.principal = None;
 
     set_client_recv_timeout(
         &stream,
@@ -2015,13 +2054,15 @@ mod tests {
         ] {
             let (mut client, server, _path) = local_stream_pair("shared-reject");
             let (tx, mut rx) = mpsc::channel(4);
+            let (audit, records) = crate::shared::audit::Audit::test_channel();
             let thread = std::thread::spawn(move || {
-                handle_client_handshake_with_auth(
+                handle_client_handshake_with_auth_and_audit(
                     server,
                     7,
                     &tx,
                     &Arc::new(AtomicBool::new(false)),
                     Some(test_shared_principal()),
+                    Some(Arc::new(audit)),
                 )
             });
             protocol::write_message(&mut client, &hello).unwrap();
@@ -2030,6 +2071,14 @@ mod tests {
             assert!(welcome.error.is_some());
             thread.join().unwrap().unwrap();
             assert!(rx.try_recv().is_err());
+            let record =
+                serde_json::to_value(records.try_recv().expect("denied attach audited")).unwrap();
+            assert_eq!(record["uid"], 1001);
+            assert_eq!(record["revision"], 7);
+            assert_eq!(record["operation"], "attach");
+            assert_eq!(record["outcome"], "denied");
+            assert!(record["scope"].is_null());
+            assert!(records.try_recv().is_err());
         }
     }
 

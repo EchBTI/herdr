@@ -4,6 +4,7 @@
 //! modules don't scatter `#[cfg]` branches through product logic.
 
 pub(crate) mod access_store;
+pub(crate) mod isolated_worker;
 pub(crate) mod shared_transport;
 #[cfg(unix)]
 pub(crate) mod ssh_agent;

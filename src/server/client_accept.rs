@@ -80,6 +80,8 @@ pub(crate) fn accept_pending_shared_client_connections(
     listener: &LocalListener,
     policy_directory: &std::path::Path,
     policy_host_id: &str,
+    policy_revision: u64,
+    audit: &Arc<crate::shared::audit::Audit>,
     next_client_id: &mut u64,
     should_quit: &Arc<AtomicBool>,
     server_event_tx: &mpsc::Sender<ServerEvent>,
@@ -100,25 +102,36 @@ pub(crate) fn accept_pending_shared_client_connections(
                 ) {
                     Ok(auth) => auth,
                     Err(error) => {
+                        if let Ok(peer) = crate::platform::local_stream_peer_identity(&stream) {
+                            audit.record(peer.uid, policy_revision, "attach", "denied", None);
+                        }
                         debug!(client_id, %error, "shared client identity rejected");
                         continue;
                     }
                 };
                 let should_quit = should_quit.clone();
                 let server_event_tx = server_event_tx.clone();
+                let audit = Arc::clone(audit);
+                let rejected_audit = Arc::clone(&audit);
+                let uid = auth.caller.uid();
+                let revision = auth.policy_revision;
                 if let Err(error) =
                     crate::thread_spawn::spawn_named("herdr-shared-client", move || {
-                        if let Err(error) = client_transport::handle_client_handshake_with_auth(
-                            stream,
-                            client_id,
-                            &server_event_tx,
-                            &should_quit,
-                            Some(auth),
-                        ) {
+                        if let Err(error) =
+                            client_transport::handle_client_handshake_with_auth_and_audit(
+                                stream,
+                                client_id,
+                                &server_event_tx,
+                                &should_quit,
+                                Some(auth),
+                                Some(audit),
+                            )
+                        {
                             debug!(client_id, %error, "shared client handshake failed");
                         }
                     })
                 {
+                    rejected_audit.record(uid, revision, "attach", "denied", None);
                     warn!(client_id, %error, "failed to spawn shared client handshake");
                 }
             }

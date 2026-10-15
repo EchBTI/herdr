@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 #[serde(deny_unknown_fields)]
 pub(crate) struct SharedScope {
     pub workspace_id: String,
+    pub workspace_incarnation: String,
     pub pane_id: String,
     pub terminal_id: String,
     pub policy_directory: std::path::PathBuf,
@@ -52,11 +53,7 @@ impl SharedScope {
         let policy = crate::access::PolicyStore::new(
             &self.policy_directory,
             owner,
-            format!(
-                "{}:{}",
-                crate::platform::host_identity().ok()?,
-                runtime_identity
-            ),
+            crate::access::policy_host_identity().ok()?,
         )
         .load()
         .ok()?;
@@ -87,7 +84,11 @@ impl SharedScope {
             crate::access::Action::Control
         };
         if policy.revision() != self.policy_revision
-            || !policy.authorize(&caller, action, Some(&self.workspace_id))
+            || !policy.authorize(
+                &caller,
+                action,
+                Some((&self.workspace_id, &self.workspace_incarnation)),
+            )
         {
             return None;
         }
@@ -107,6 +108,8 @@ impl SharedScope {
             return false;
         };
         workspace.id == self.workspace_id
+            && workspace.incarnation == self.workspace_incarnation
+            && crate::workspace::valid_workspace_incarnation(&workspace.incarnation)
             && workspace
                 .terminal_id(pane)
                 .is_some_and(|terminal| terminal.as_str() == self.terminal_id)
@@ -137,6 +140,7 @@ mod tests {
             caller_uid: 0,
             expires_unix_ms: 0,
             workspace_id: workspace.id.clone(),
+            workspace_incarnation: workspace.incarnation.clone(),
             pane_id: format!("p_{}", pane.raw()),
             terminal_id: workspace.terminal_id(pane).unwrap().to_string(),
         };
@@ -212,7 +216,7 @@ mod linux_authorization_tests {
         let store = PolicyStore::new(
             &directory,
             owner_uid,
-            format!("{}:{}", crate::platform::host_identity().unwrap(), runtime),
+            crate::access::policy_host_identity().unwrap(),
         );
         let (_, receiver) = tokio::sync::mpsc::unbounded_channel();
         let mut app = crate::app::App::new(
@@ -226,6 +230,7 @@ mod linux_authorization_tests {
         let pane = workspace.tabs[0].root_pane;
         let scope = SharedScope {
             workspace_id: workspace.id.clone(),
+            workspace_incarnation: workspace.incarnation.clone(),
             pane_id: format!("p_{}", pane.raw()),
             terminal_id: workspace.terminal_id(pane).unwrap().to_string(),
             policy_directory: directory.clone(),
@@ -248,6 +253,7 @@ mod linux_authorization_tests {
                     uid: participant.uid,
                     account_name: participant.name.clone(),
                     workspace_id: scope.workspace_id.clone(),
+                    workspace_incarnation: scope.workspace_incarnation.clone(),
                     role: Role::View,
                 }],
                 false,
@@ -273,6 +279,7 @@ mod linux_authorization_tests {
                     uid: participant.uid,
                     account_name: format!("{}-reused", participant.name),
                     workspace_id: scope.workspace_id.clone(),
+                    workspace_incarnation: scope.workspace_incarnation.clone(),
                     role: Role::View,
                 }],
                 false,
@@ -282,5 +289,40 @@ mod linux_authorization_tests {
         latest.policy_revision = 3;
         assert!(latest.authorize_execution(&app, &read).is_none());
         std::fs::remove_dir_all(directory).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod incarnation_tests {
+    use super::*;
+    #[test]
+    fn same_public_id_and_terminal_cannot_bypass_replaced_workspace_incarnation() {
+        let (_, receiver) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = crate::app::App::new(
+            &crate::config::Config::default(),
+            crate::app::AppPolicy::TEST,
+            None,
+            receiver,
+            crate::api::EventHub::default(),
+        );
+        let workspace = crate::workspace::Workspace::test_new("shared");
+        let pane = workspace.tabs[0].root_pane;
+        let scope = SharedScope {
+            workspace_id: workspace.id.clone(),
+            workspace_incarnation: workspace.incarnation.clone(),
+            pane_id: format!("p_{}", pane.raw()),
+            terminal_id: workspace.terminal_id(pane).unwrap().to_string(),
+            policy_directory: "/unused".into(),
+            policy_revision: 0,
+            caller_uid: 1001,
+            expires_unix_ms: u64::MAX,
+            expected_runtime_identity: "runtime".into(),
+        };
+        let request: Request = serde_json::from_value(serde_json::json!({"id":"scope", "method":"pane.read", "params":{"pane_id":scope.pane_id,"source":"visible"}})).unwrap();
+        app.state.workspaces = vec![workspace];
+        app.state.active = Some(0);
+        assert!(scope.validates(&app, &request));
+        app.state.workspaces[0].incarnation = crate::workspace::generate_workspace_incarnation();
+        assert!(!scope.validates(&app, &request));
     }
 }

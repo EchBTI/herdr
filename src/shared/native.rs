@@ -15,6 +15,16 @@ pub(crate) enum NativeCommand {
         policy_directory: PathBuf,
     },
     Clients,
+    WorkspaceIdentities,
+    WorkerStatus,
+    WorkerExecute {
+        workspace_id: String,
+        incarnation: String,
+        request: Box<crate::api::schema::Request>,
+    },
+    CommitPolicy {
+        policy: Box<crate::access::AccessPolicy>,
+    },
     Refresh,
     Disable,
 }

@@ -438,6 +438,32 @@ impl App {
         id: String,
         params: PluginPaneOpenParams,
     ) -> String {
+        let isolated = params
+            .workspace_id
+            .as_deref()
+            .and_then(|id| self.parse_workspace_id(id))
+            .into_iter()
+            .chain(
+                params
+                    .target_pane_id
+                    .as_deref()
+                    .and_then(|id| self.parse_pane_id(id))
+                    .map(|(index, _)| index),
+            )
+            .chain(self.state.active)
+            .any(|index| {
+                self.state
+                    .workspaces
+                    .get(index)
+                    .is_some_and(|workspace| workspace.isolated_execution)
+            });
+        if isolated {
+            return encode_error(
+                id,
+                "isolated_execution_required",
+                "owner plugin panes are unavailable from isolated workspaces",
+            );
+        }
         if let Err(err) = self.refresh_installed_plugins() {
             return encode_error(id, "plugin_registry_load_failed", err.to_string());
         }
@@ -1581,6 +1607,27 @@ platforms = ["linux", "macos"]
         assert!(plugin.enabled);
 
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn isolated_workspaces_reject_owner_plugin_panes_before_registry_lookup() {
+        let mut app = test_app();
+        let mut workspace = crate::workspace::Workspace::test_new("isolated");
+        workspace.isolated_execution = true;
+        app.state.workspaces = vec![workspace];
+        app.state.active = Some(0);
+        for placement in ["split", "tab", "popup", "overlay", "zoomed"] {
+            let params: PluginPaneOpenParams = serde_json::from_value(serde_json::json!({
+                "plugin_id": "example.missing", "entrypoint": "ui", "placement": placement
+            }))
+            .expect("plugin params");
+            let response = app.handle_plugin_pane_open("isolated-plugin".into(), params);
+            let value: serde_json::Value = serde_json::from_str(&response).expect("response");
+            assert_eq!(
+                value["error"]["code"], "isolated_execution_required",
+                "{placement}"
+            );
+        }
     }
 
     #[test]

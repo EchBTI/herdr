@@ -18,6 +18,7 @@ fn policy(role: Role) -> AccessPolicy {
                 uid: 1001,
                 account_name: "alice".into(),
                 workspace_id: "space-a".into(),
+                workspace_incarnation: "wi_00000000000000000000000000000001".into(),
                 role,
             }],
             true,
@@ -26,8 +27,8 @@ fn policy(role: Role) -> AccessPolicy {
 }
 fn snapshot() -> Value {
     json!({"focused_workspace_id":"space-b","version":"SECRET_VERSION",
-        "workspaces":[{"workspace_id":"space-a","label":"Allowed","pane_count":999,"worktree":{"repo_root":"SECRET_PATH"}},
-            {"workspace_id":"space-b","label":"SECRET_SPACE"}],
+        "workspaces":[{"workspace_id":"space-a","incarnation":"wi_00000000000000000000000000000001","label":"Allowed","pane_count":999,"worktree":{"repo_root":"SECRET_PATH"}},
+            {"workspace_id":"space-b","incarnation":"wi_00000000000000000000000000000002","label":"SECRET_SPACE"}],
         "tabs":[{"workspace_id":"space-a","tab_id":"tab-a","label":"Allowed tab"},
             {"workspace_id":"space-b","tab_id":"tab-b","label":"SECRET_TAB"}],
         "panes":[{"workspace_id":"space-a","tab_id":"tab-a","pane_id":"pane-a","label":"Allowed pane","terminal_id":"terminal-a","cwd":"SECRET_CWD","agent":"SECRET_AGENT"},
@@ -65,19 +66,43 @@ fn no_grant_and_renamed_account_get_empty_projection() {
 fn view_grants_cannot_acquire_control_or_owner_authority() {
     let policy = policy(Role::View);
     for action in [Action::Control, Action::OwnerOnly, Action::Unknown] {
-        assert!(!policy.authorize(&alice(), action, Some("space-a")));
+        assert!(!policy.authorize(
+            &alice(),
+            action,
+            Some(("space-a", "wi_00000000000000000000000000000001"))
+        ));
     }
-    assert!(!policy.authorize(&alice(), Action::Read, Some("space-b")));
-    assert!(policy.authorize(&alice(), Action::Read, Some("space-a")));
+    assert!(!policy.authorize(
+        &alice(),
+        Action::Read,
+        Some(("space-b", "wi_00000000000000000000000000000001"))
+    ));
+    assert!(policy.authorize(
+        &alice(),
+        Action::Read,
+        Some(("space-a", "wi_00000000000000000000000000000001"))
+    ));
 }
 
 #[test]
 fn control_grants_remain_space_scoped() {
     let policy = policy(Role::Control);
-    assert!(policy.authorize(&alice(), Action::Control, Some("space-a")));
-    assert!(!policy.authorize(&alice(), Action::Control, Some("space-b")));
+    assert!(policy.authorize(
+        &alice(),
+        Action::Control,
+        Some(("space-a", "wi_00000000000000000000000000000001"))
+    ));
+    assert!(!policy.authorize(
+        &alice(),
+        Action::Control,
+        Some(("space-b", "wi_00000000000000000000000000000001"))
+    ));
     assert!(!policy.authorize(&alice(), Action::OwnerOnly, None));
-    assert!(!policy.authorize(&alice(), Action::Unknown, Some("space-a")));
+    assert!(!policy.authorize(
+        &alice(),
+        Action::Unknown,
+        Some(("space-a", "wi_00000000000000000000000000000001"))
+    ));
 }
 
 #[test]
@@ -90,7 +115,11 @@ fn revocation_replaces_projection_and_denies_input() {
         project_spaces(&snapshot(), &revoked, &alice())["workspaces"],
         json!([])
     );
-    assert!(!revoked.authorize(&alice(), Action::Control, Some("space-a")));
+    assert!(!revoked.authorize(
+        &alice(),
+        Action::Control,
+        Some(("space-a", "wi_00000000000000000000000000000001"))
+    ));
     assert_eq!(revoked.revision(), original.revision() + 1);
 }
 
@@ -192,12 +221,14 @@ fn retained_stale_grants_do_not_block_unrelated_edit_or_revocation() {
         uid: 2000,
         account_name: "old-account".into(),
         workspace_id: "deleted-space".into(),
+        workspace_incarnation: "wi_00000000000000000000000000000001".into(),
         role: Role::View,
     };
     let new = Grant {
         uid: 1001,
         account_name: "alice".into(),
         workspace_id: "space-a".into(),
+        workspace_incarnation: "wi_00000000000000000000000000000001".into(),
         role: Role::View,
     };
     assert!(validate_new_grants(
@@ -238,4 +269,34 @@ fn owner_can_disable_without_live_runtime_or_valid_policy() {
     };
     assert!(context.execute(1001, &request).is_err());
     assert!(context.execute(1000, &request).unwrap().1);
+}
+
+#[test]
+fn durable_owner_grants_bind_current_server_incarnation_without_rebinding_stale_grants() {
+    let existing = policy(Role::View).grants().to_vec();
+    let mut submitted = existing.clone();
+    submitted[0].workspace_incarnation.clear();
+    bind_new_grants(&mut submitted, &[], &snapshot()).unwrap();
+    assert_eq!(submitted, existing);
+    let mut recreated = snapshot();
+    recreated["workspaces"][0]["incarnation"] = "wi_00000000000000000000000000000002".into();
+    assert!(
+        project_spaces(&recreated, &policy(Role::View), &alice())["workspaces"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+    assert!(bind_new_grants(&mut submitted, &[], &recreated).is_err());
+    let mut retained = existing.clone();
+    bind_new_grants(&mut retained, &existing, &recreated).unwrap();
+    assert_eq!(
+        retained, existing,
+        "stale grant must not be silently rebound to a replacement"
+    );
+    submitted[0].workspace_incarnation.clear();
+    bind_new_grants(&mut submitted, &[], &recreated).unwrap();
+    assert_ne!(
+        submitted[0].workspace_incarnation,
+        existing[0].workspace_incarnation
+    );
 }

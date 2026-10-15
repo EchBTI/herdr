@@ -8,8 +8,18 @@ use crate::layout::Node;
 use crate::terminal::TerminalRuntimeRegistry;
 use crate::workspace::Workspace;
 
-/// Current snapshot format version.
+/// Ordinary sessions remain readable by existing binaries. Isolation requires a
+/// version older readers reject before they can launch a pane as the owner.
 pub(super) const SNAPSHOT_VERSION: u32 = 3;
+pub(super) const MAX_SNAPSHOT_VERSION: u32 = 4;
+
+pub(super) fn session_format_version(isolated_execution: bool) -> u32 {
+    if isolated_execution {
+        MAX_SNAPSHOT_VERSION
+    } else {
+        SNAPSHOT_VERSION
+    }
+}
 
 /// Serializable snapshot of the entire herdr session.
 #[derive(Serialize, Deserialize)]
@@ -50,6 +60,10 @@ pub struct TabHistorySnapshot {
 
 #[derive(Serialize, Deserialize)]
 pub struct WorkspaceSnapshot {
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub isolated_execution: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub incarnation: Option<String>,
     #[serde(default)]
     pub id: Option<String>,
     #[serde(default)]
@@ -166,6 +180,8 @@ impl From<LegacyWorkspaceSnapshot> for WorkspaceSnapshot {
 
         Self {
             id: None,
+            incarnation: None,
+            isolated_execution: false,
             custom_name: snap.custom_name,
             identity_cwd,
             worktree_space: None,
@@ -271,7 +287,11 @@ pub fn capture(
     selected: usize,
 ) -> SessionSnapshot {
     SessionSnapshot {
-        version: SNAPSHOT_VERSION,
+        version: session_format_version(
+            workspaces
+                .iter()
+                .any(|workspace| workspace.isolated_execution),
+        ),
         workspaces: workspaces
             .iter()
             .map(|workspace| capture_workspace(workspace, terminals, terminal_runtimes))
@@ -295,7 +315,14 @@ fn capture_workspace(
     let tabs: Vec<_> = ws
         .tabs
         .iter()
-        .map(|tab| capture_tab(tab, terminals, terminal_runtimes))
+        .map(|tab| {
+            capture_tab(
+                tab,
+                terminals,
+                terminal_runtimes,
+                ws.isolated_execution.then_some(ws.identity_cwd.as_path()),
+            )
+        })
         .collect();
     let identity_cwd = tabs
         .first()
@@ -304,6 +331,8 @@ fn capture_workspace(
         .unwrap_or_else(|| ws.identity_cwd.clone());
     WorkspaceSnapshot {
         id: Some(ws.id.clone()),
+        incarnation: Some(ws.incarnation.clone()),
+        isolated_execution: ws.isolated_execution,
         custom_name: ws.custom_name.clone(),
         identity_cwd,
         worktree_space: ws.worktree_space.clone(),
@@ -327,16 +356,30 @@ fn capture_tab(
         crate::terminal::TerminalState,
     >,
     terminal_runtimes: &TerminalRuntimeRegistry,
+    isolated_fallback: Option<&std::path::Path>,
 ) -> TabSnapshot {
     let mut panes = HashMap::new();
     for id in tab.panes.keys() {
         let terminal_id = tab.terminal_id(*id);
         let terminal = terminal_id.and_then(|id| terminals.get(id));
-        let cwd = terminal_id
-            .and_then(|id| terminal_runtimes.get(id))
-            .and_then(|runtime| runtime.cwd_for_persistence())
-            .or_else(|| terminal.map(|terminal| terminal.cwd.clone()))
-            .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| "/".into()));
+        let runtime = terminal_id.and_then(|id| terminal_runtimes.get(id));
+        let cwd = if let Some(fallback) = isolated_fallback {
+            runtime
+                .filter(|runtime| runtime.isolated_execution())
+                .and_then(|runtime| runtime.cwd_for_persistence())
+                .filter(|cwd| {
+                    cwd.is_absolute()
+                        && !cwd
+                            .components()
+                            .any(|component| matches!(component, std::path::Component::ParentDir))
+                })
+                .unwrap_or_else(|| fallback.to_path_buf())
+        } else {
+            runtime
+                .and_then(|runtime| runtime.cwd_for_persistence())
+                .or_else(|| terminal.map(|terminal| terminal.cwd.clone()))
+                .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| "/".into()))
+        };
         let label = terminal.and_then(|terminal| terminal.manual_label.clone());
         let (agent_name, managed_agent_kind) = terminal
             .filter(|terminal| !terminal.managed_agent_launch_pending())
@@ -483,10 +526,10 @@ pub(super) fn capture_node(node: &Node) -> LayoutSnapshot {
 
 pub(super) fn parse_snapshot(content: &str) -> Result<SessionSnapshot, String> {
     let raw = serde_json::from_str::<RawSessionSnapshot>(content).map_err(|e| e.to_string())?;
-    if raw.version > SNAPSHOT_VERSION {
+    if raw.version > MAX_SNAPSHOT_VERSION {
         return Err(format!(
             "snapshot version {} is newer than supported {}",
-            raw.version, SNAPSHOT_VERSION
+            raw.version, MAX_SNAPSHOT_VERSION
         ));
     }
     migrate_snapshot(raw)
@@ -495,10 +538,10 @@ pub(super) fn parse_snapshot(content: &str) -> Result<SessionSnapshot, String> {
 pub(super) fn parse_history_snapshot(content: &str) -> Result<SessionHistorySnapshot, String> {
     let snapshot =
         serde_json::from_str::<SessionHistorySnapshot>(content).map_err(|e| e.to_string())?;
-    if snapshot.version > SNAPSHOT_VERSION {
+    if snapshot.version > MAX_SNAPSHOT_VERSION {
         return Err(format!(
             "history snapshot version {} is newer than supported {}",
-            snapshot.version, SNAPSHOT_VERSION
+            snapshot.version, MAX_SNAPSHOT_VERSION
         ));
     }
     Ok(snapshot)
@@ -724,6 +767,8 @@ mod tests {
 
         let snap = SessionSnapshot {
             workspaces: vec![WorkspaceSnapshot {
+                incarnation: None,
+                isolated_execution: false,
                 id: Some("wproj".to_string()),
                 custom_name: Some("pi-mono".to_string()),
                 identity_cwd: PathBuf::from("/home/can/Projects/herdr"),
@@ -1425,6 +1470,8 @@ mod tests {
         let snap = SessionSnapshot {
             version: SNAPSHOT_VERSION,
             workspaces: vec![WorkspaceSnapshot {
+                incarnation: None,
+                isolated_execution: false,
                 id: Some("test-ws".to_string()),
                 custom_name: Some("fallback test".to_string()),
                 identity_cwd: PathBuf::from("/tmp"),
@@ -1462,5 +1509,70 @@ mod tests {
             restored.workspaces[0].tabs[0].panes[&0].cwd,
             PathBuf::from("/tmp/this-directory-does-not-exist-for-herdr-test")
         );
+    }
+}
+
+#[cfg(test)]
+mod isolated_execution_tests {
+    use super::*;
+    #[test]
+    fn isolated_session_version_gate_preserves_ordinary_compatibility() {
+        let mut workspace = Workspace::test_new("versioned");
+        let ordinary = capture(
+            std::slice::from_ref(&workspace),
+            &HashMap::new(),
+            &Default::default(),
+            Some(0),
+            0,
+        );
+        assert_eq!(ordinary.version, 3);
+        workspace.isolated_execution = true;
+        let isolated = capture(
+            &[workspace],
+            &HashMap::new(),
+            &Default::default(),
+            Some(0),
+            0,
+        );
+        assert_eq!(isolated.version, 4);
+        let encoded = serde_json::to_string(&isolated).unwrap();
+        assert!(
+            snapshot_file_version(&encoded).unwrap() > SNAPSHOT_VERSION,
+            "v3 readers reject before migration or launch"
+        );
+        let decoded = parse_snapshot(&encoded).expect("new reader accepts v4");
+        assert!(decoded.workspaces[0].isolated_execution);
+        assert!(parse_snapshot(r#"{"version":4,"workspaces":[]}"#).is_ok());
+        assert!(parse_snapshot(r#"{"version":5,"workspaces":[]}"#).is_err());
+    }
+
+    #[test]
+    fn isolated_worker_snapshot_preserves_required_mode_and_host_cwd_without_runtime() {
+        let mut workspace = Workspace::test_new("isolated");
+        workspace.isolated_execution = true;
+        workspace.identity_cwd = PathBuf::from("/srv/isolated-project");
+        let pane = workspace.tabs[0].root_pane;
+        let snapshot = capture(
+            &[workspace],
+            &HashMap::new(),
+            &Default::default(),
+            Some(0),
+            0,
+        );
+        assert_eq!(snapshot.version, 4);
+        let captured = &snapshot.workspaces[0];
+        assert!(captured.isolated_execution);
+        assert_eq!(
+            captured.identity_cwd,
+            PathBuf::from("/srv/isolated-project")
+        );
+        assert_eq!(
+            captured.tabs[0].panes[&pane.raw()].cwd,
+            captured.identity_cwd
+        );
+        let restored: SessionSnapshot =
+            serde_json::from_slice(&serde_json::to_vec(&snapshot).unwrap()).unwrap();
+        assert!(restored.workspaces[0].isolated_execution);
+        assert_eq!(restored.workspaces[0].incarnation, captured.incarnation);
     }
 }

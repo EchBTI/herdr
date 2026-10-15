@@ -222,7 +222,7 @@ mod native {
             return Err(io::Error::last_os_error());
         }
         // SAFETY: advisory exclusive lock serializes this log's writer processes.
-        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } != 0 {
+        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
             return Err(io::Error::last_os_error());
         }
         let metadata = file.metadata()?;
@@ -505,6 +505,7 @@ mod tests {
                     uid: f.owner().checked_add(1).unwrap(),
                     account_name: "participant".into(),
                     workspace_id: "space".into(),
+                    workspace_incarnation: "wi_00000000000000000000000000000001".into(),
                     role: Role::View,
                 }],
                 false,

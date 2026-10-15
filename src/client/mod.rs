@@ -2209,6 +2209,20 @@ async fn run_client_loop(
                         }
                     }
                     ServerMessage::EndpointControl { kind, data } => {
+                        if kind == "worker.execution.v1" {
+                            if let Ok(projection) = serde_json::from_str(&data) {
+                                if let Some(shell) = state.shell.as_mut() {
+                                    shell.set_worker_execution_projection(&endpoint_id, projection);
+                                }
+                                state.request_repaint();
+                                if let Some(frame) = state.shell.as_mut().and_then(|shell| {
+                                    shell.compose(state.reported_size.0, state.reported_size.1)
+                                }) {
+                                    state.present_frame(frame);
+                                }
+                            }
+                            continue;
+                        }
                         if kind == "shared.access.v1" {
                             if shared_client {
                                 let access = serde_json::from_str(&data).map_err(|error| {

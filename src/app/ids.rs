@@ -49,11 +49,10 @@ impl App {
         let tab_id = self.public_tab_id(ws_idx, tab_idx)?;
         let pane_id = self.public_pane_id(ws_idx, pane_id)?;
         Some(
-            crate::pane::PaneLaunchEnv::from_extra(extra_env).with_identity(
-                workspace_id,
-                tab_id,
-                pane_id,
-            ),
+            crate::pane::PaneLaunchEnv::from_extra(extra_env)
+                .with_identity(workspace_id, tab_id, pane_id)
+                .with_workspace_incarnation(ws.incarnation.clone())
+                .with_isolation_required(ws.isolated_execution),
         )
     }
 

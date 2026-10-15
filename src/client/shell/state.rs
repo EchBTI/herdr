@@ -859,6 +859,8 @@ pub(super) struct ClientCopyModeState {
 }
 
 pub(crate) struct ClientShellState {
+    pub(super) worker_execution:
+        HashMap<ClientEndpointId, super::execution::WorkerExecutionProjection>,
     pub(super) owner_space_access: bool,
     pub(super) shared_access: Option<super::shared_access::SharedAccess>,
     pub(super) machine_diagnostics: super::machine_diagnostics::MachineDiagnostics,
@@ -1034,6 +1036,7 @@ impl ClientShellState {
                 .extend(saved.collapsed_groups);
         }
         Self {
+            worker_execution: HashMap::new(),
             owner_space_access: false,
             shared_access: None,
             machine_diagnostics: Default::default(),
@@ -1591,6 +1594,7 @@ impl ClientShellState {
                 Some(_) => {}
             }
         }
+        self.apply_worker_execution_label(&mut snapshot);
         self.snapshot = Some(snapshot);
         self.reconcile_pending_workspace_highlight();
         let pending_surface = self.pending_pane_surface.take();
