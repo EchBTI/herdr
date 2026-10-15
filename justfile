@@ -260,3 +260,8 @@ release $version $preview:
 # Print default config
 default-config:
     cargo run --release --locked -- --default-config
+
+# Opt-in qualification creates fixture OS accounts only inside a disposable container.
+test-shared-access-linux:
+    docker build -f scripts/shared-access-test.Dockerfile -t herdr-shared-test .
+    docker run --rm -e HERDR_SHARED_TEST_DISPOSABLE=1 herdr-shared-test

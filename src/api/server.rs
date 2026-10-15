@@ -347,6 +347,40 @@ fn handle_connection_with_stop(
         return Ok(());
     }
 
+    // A new private method fails closed against older daemons, which reject
+    // unknown methods instead of silently ignoring an authorization field.
+    let raw: serde_json::Value = serde_json::from_str(line).unwrap_or_default();
+    if raw.get("method").and_then(serde_json::Value::as_str) == Some("shared.execute.v1") {
+        #[derive(serde::Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct ScopedParams {
+            request: Request,
+            scope: crate::shared::scope::SharedScope,
+        }
+        let id = raw
+            .get("id")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default();
+        let params = serde_json::from_value::<ScopedParams>(raw["params"].clone());
+        let response = match params {
+            Ok(mut params)
+                if params.request.id == id
+                    && params.scope.target(&params.request.method).is_some() =>
+            {
+                if let Method::PaneRead(read) = &mut params.request.method {
+                    read.intent = crate::api::schema::ReadIntent::Passive;
+                }
+                dispatch_scoped_to_app(params.request, params.scope, api_tx)
+            }
+            _ => error_response_json(
+                id.to_owned(),
+                "unavailable",
+                "object unavailable or access denied".into(),
+            ),
+        };
+        return write_text_line_allow_disconnect(&mut stream, &response);
+    }
+
     let request = match serde_json::from_str::<Request>(line) {
         Ok(request) => request,
         Err(request_error) => {
@@ -966,6 +1000,7 @@ fn dispatch_to_app(
     if let Err(err) = api_tx.send(ApiRequestMessage {
         request,
         respond_to,
+        shared_scope: None,
         response_write_complete,
     }) {
         return error_response_json(
@@ -1847,4 +1882,29 @@ mod tests {
         assert!(result.is_ok());
         server_thread.join().unwrap();
     }
+}
+
+// Expiry and locked durable policy validation at native execution protect
+// queued requests even if the broker has already timed out.
+fn dispatch_scoped_to_app(
+    request: Request,
+    scope: crate::shared::scope::SharedScope,
+    api_tx: &ApiRequestSender,
+) -> String {
+    let denied = crate::shared::scope::SharedScope::denied_response(&request);
+    let (respond_to, response_rx) = std::sync::mpsc::channel();
+    if api_tx
+        .send(ApiRequestMessage {
+            request,
+            respond_to,
+            response_write_complete: None,
+            shared_scope: Some(scope),
+        })
+        .is_err()
+    {
+        return denied;
+    }
+    response_rx
+        .recv_timeout(Duration::from_secs(3))
+        .unwrap_or(denied)
 }

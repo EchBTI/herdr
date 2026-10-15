@@ -3,8 +3,93 @@
 //! Centralizes OS-dependent behavior behind a clean boundary so core
 //! modules don't scatter `#[cfg]` branches through product logic.
 
+pub(crate) mod access_store;
+pub(crate) mod shared_transport;
 #[cfg(unix)]
 pub(crate) mod ssh_agent;
+
+/// Identity authenticated by the kernel, never by client-supplied metadata.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct PeerIdentity {
+    pub(crate) uid: u32,
+    pub(crate) gid: u32,
+    pub(crate) pid: Option<u32>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+pub(crate) struct OsAccount {
+    pub(crate) uid: u32,
+    pub(crate) gid: u32,
+    pub(crate) name: String,
+    pub(crate) description: String,
+    pub(crate) home: std::path::PathBuf,
+    pub(crate) shell: std::path::PathBuf,
+}
+
+impl OsAccount {
+    /// A display-list heuristic only. Explicit lookup must still accept service accounts.
+    pub(crate) fn has_login_shell(&self) -> bool {
+        self.shell
+            .file_name()
+            .is_some_and(|name| name != "nologin" && name != "false" && !name.is_empty())
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+pub(crate) struct OsGroup {
+    pub(crate) gid: u32,
+    pub(crate) name: String,
+}
+
+// Shared hosting is Linux-first. Unsupported platforms must never invent a UID
+// or trust an environment variable as a substitute for authenticated identity.
+#[cfg(not(target_os = "linux"))]
+mod unsupported_identity {
+    use super::{OsAccount, OsGroup, PeerIdentity};
+    use std::io;
+
+    fn unsupported<T>() -> io::Result<T> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "OS-user shared access requires Linux",
+        ))
+    }
+
+    pub(crate) fn local_stream_peer_identity(
+        _: &crate::ipc::LocalStream,
+    ) -> io::Result<PeerIdentity> {
+        unsupported()
+    }
+    pub(crate) fn effective_uid() -> io::Result<u32> {
+        unsupported()
+    }
+    pub(crate) fn host_identity() -> io::Result<String> {
+        unsupported()
+    }
+    pub(crate) fn process_identity(_: u32) -> io::Result<String> {
+        unsupported()
+    }
+    pub(crate) fn current_process_identity() -> io::Result<String> {
+        unsupported()
+    }
+    pub(crate) fn os_account_by_uid(_: u32) -> io::Result<Option<OsAccount>> {
+        unsupported()
+    }
+    pub(crate) fn os_account_by_name(_: &str) -> io::Result<Option<OsAccount>> {
+        unsupported()
+    }
+    pub(crate) fn os_accounts() -> io::Result<Vec<OsAccount>> {
+        unsupported()
+    }
+    pub(crate) fn os_group_by_name(_: &str) -> io::Result<Option<OsGroup>> {
+        unsupported()
+    }
+    pub(crate) fn os_account_in_group(_: &OsAccount, _: u32) -> io::Result<bool> {
+        unsupported()
+    }
+}
+#[cfg(not(target_os = "linux"))]
+pub(crate) use unsupported_identity::*;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 // Native adapters construct only the event classifications their OS can report.

@@ -1,6 +1,6 @@
 # OS-user access to shared Herdr spaces
 
-Status: implementation specification, no runtime changes delivered
+Status: trusted-collaboration preview implemented; full native-client PRD remains in progress
 
 Date: 15 October 2026
 
@@ -145,3 +145,19 @@ The issue tracker is authoritative for status and dependency ordering. This map 
 - Start with `bd ready`, then `bd show herdr-17y.1`. Claim one ready issue with `bd update <id> --claim` before implementation.
 
 See `.beads/PLANNING.md` for tracker recovery and sync instructions. No implementation task has been marked complete by preparation of this specification.
+
+## Implementation conformance (15 October 2026)
+
+The fork now implements a separate Linux sharing broker, shared text frontend, owner access screen, and scoped owner-private native dispatch. This bounds the exposed surface while preserving existing owner-only sockets and all frozen protocol codecs.
+
+Verified OS users receive only allowlisted metadata and terminal text for granted spaces. View cannot send input or mutate terminal geometry. Control can send keys/text and create panes; native checks bind the policy, account, runtime, workspace and terminal at execution. A cross-process policy lock makes revocation a barrier against queued input. New/changed Control grants require acknowledgement of owner-account execution privileges.
+
+Preview adaptations to this specification:
+
+- Grants are bound to one live native server runtime. Restarting the sharing broker preserves them; restarting the native server requires regranting. Persistent workspace incarnations and automatic deleted-grant cleanup remain follow-up work.
+- The owner opens administration with `herdr --session <name> session access`. Native session-menu integration and live connected-client indicators remain pending.
+- Shared attachment uses a separate polling text frontend. Existing native client, direct attach, SSH bridge, graphics, events and global APIs remain private. Their non-owner protocol integration is pending, rather than being exposed with partial permission checks.
+- Already delivered output may remain visible until the next poll and can be retained by recipients. This preview makes no immediate client-cache-erasure claim.
+- User/operator instructions and explicit limitations are in `docs/next/shared-access.md`. Qualification scripts run only inside an explicitly disposable Linux container.
+
+These adaptations are implemented safety boundaries, not evidence that every original acceptance gate or isolated-execution phase is complete. Beads retains the outstanding release work.

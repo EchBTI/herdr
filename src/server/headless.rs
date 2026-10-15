@@ -2918,6 +2918,19 @@ impl HeadlessServer {
             return false;
         }
 
+        if msg
+            .shared_scope
+            .as_ref()
+            .is_some_and(|scope| !scope.unexpired() || !scope.validates(&self.app, &msg.request))
+        {
+            let _ = msg
+                .respond_to
+                .send(crate::shared::scope::SharedScope::denied_response(
+                    &msg.request,
+                ));
+            return false;
+        }
+
         let frozen_alt_screen_read = match self.alt_screen_read_conflict(&msg.request) {
             AltScreenReadConflict::None => None,
             AltScreenReadConflict::Frozen(snapshot) => Some(snapshot),
@@ -2988,6 +3001,23 @@ impl HeadlessServer {
             Self::reject_api_request_for_shutdown(msg);
             return changed;
         }
+
+        // Keep the shared policy lock through execution so an acknowledged
+        // revoke cannot race between authorization and the native action.
+        let _shared_policy_guard =
+            if let Some(scope) = msg.shared_scope.as_ref() {
+                match scope.authorize_execution(&self.app, &msg.request) {
+                    Some(guard) => Some(guard),
+                    None => {
+                        let _ = msg.respond_to.send(
+                            crate::shared::scope::SharedScope::denied_response(&msg.request),
+                        );
+                        return changed;
+                    }
+                }
+            } else {
+                None
+            };
 
         // Capture toast and effective pane states before the API call so we can
         // forward resulting client-local notifications. API requests like
@@ -3063,6 +3093,18 @@ impl HeadlessServer {
         }) {
             self.app.state.view.terminal_area =
                 Rect::new(0, 0, self.effective_size.0, self.effective_size.1);
+        }
+        if msg
+            .shared_scope
+            .as_ref()
+            .is_some_and(|scope| !scope.unexpired() || !scope.validates(&self.app, &msg.request))
+        {
+            let _ = msg
+                .respond_to
+                .send(crate::shared::scope::SharedScope::denied_response(
+                    &msg.request,
+                ));
+            return changed;
         }
         let mut response = if matches!(
             &msg.request.method,

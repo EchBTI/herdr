@@ -24,6 +24,7 @@ pub(crate) fn request_changes_ui(request: &Request) -> bool {
 }
 
 pub struct ApiRequestMessage {
+    pub(crate) shared_scope: Option<crate::shared::scope::SharedScope>,
     pub request: Request,
     pub respond_to: std::sync::mpsc::Sender<String>,
     pub response_write_complete: Option<std::sync::mpsc::Receiver<()>>,

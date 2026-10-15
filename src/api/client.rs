@@ -60,6 +60,58 @@ impl ApiClient {
         read_json_line(&mut reader)
     }
 
+    pub(crate) fn runtime_identity(&self) -> Result<String, ApiClientError> {
+        let stream = self.connect()?;
+        let peer = crate::platform::local_stream_peer_identity(&stream)?;
+        if peer.uid != crate::platform::effective_uid()? {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "native server owner mismatch",
+            )
+            .into());
+        }
+        let pid = peer.pid.ok_or_else(|| {
+            io::Error::new(io::ErrorKind::Unsupported, "native server PID unavailable")
+        })?;
+        Ok(crate::platform::process_identity(pid)?)
+    }
+
+    /// Native execution rechecks durable policy under a lock. Expired queued
+    /// requests cannot execute after the client has timed out.
+    pub(crate) fn request_scoped(
+        &self,
+        request: &Request,
+        scope: &crate::shared::scope::SharedScope,
+    ) -> Result<serde_json::Value, ApiClientError> {
+        let mut stream = self.connect()?;
+        let owner = crate::platform::effective_uid()?;
+        if crate::platform::local_stream_peer_identity(&stream)?.uid != owner {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "native server owner mismatch",
+            )
+            .into());
+        }
+        set_timeout_best_effort(&stream, TimeoutKind::Send, Duration::from_secs(3))?;
+        set_timeout_best_effort(&stream, TimeoutKind::Recv, Duration::from_secs(3))?;
+        let mut scope = scope.clone();
+        scope.expires_unix_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(io::Error::other)?
+            .as_millis()
+            .saturating_add(2500)
+            .try_into()
+            .map_err(io::Error::other)?;
+        let value = serde_json::json!({
+            "id":request.id, "method":"shared.execute.v1",
+            "params":{"request":request,"scope":scope}
+        });
+        stream.write_all(serde_json::to_string(&value)?.as_bytes())?;
+        stream.write_all(b"\n")?;
+        stream.flush()?;
+        read_json_line(&mut BufReader::new(stream))
+    }
+
     pub fn request_value_with_timeout(
         &self,
         request: &Request,

@@ -12,6 +12,7 @@ fn queue_requests(server: &mut HeadlessServer, count: usize) -> std::sync::mpsc:
                     method: api::schema::Method::WorkspaceList(api::schema::EmptyParams::default()),
                 },
                 respond_to: respond_to.clone(),
+                shared_scope: None,
                 response_write_complete: None,
             })
             .unwrap();
@@ -118,6 +119,7 @@ async fn server_loop_drains_api_backlog_and_runs_scheduled_work() {
                     method,
                 },
                 respond_to: respond_to.clone(),
+                shared_scope: None,
                 response_write_complete: None,
             })
             .unwrap();

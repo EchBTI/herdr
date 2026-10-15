@@ -126,6 +126,7 @@ impl HeadlessServer {
                 api::ApiRequestMessage {
                     request: *request,
                     respond_to,
+                    shared_scope: None,
                     response_write_complete: None,
                 },
             )

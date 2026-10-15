@@ -28,6 +28,7 @@ fn public_move(
             method: crate::api::schema::Method::PaneMove(params),
         },
         respond_to,
+        shared_scope: None,
         response_write_complete: None,
     });
     let response = response_rx.recv().expect("pane move response");
