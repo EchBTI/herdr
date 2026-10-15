@@ -1,0 +1,1 @@
+{"id":"int-dadf958c9f3aac5ad42f74c3ba4d63ab","kind":"field_change","created_at":"2026-10-15T08:34:12.188953Z","actor":"emech","issue_id":"herdr-j0m","extra":{"field":"status","new_value":"closed","old_value":"in_progress","reason":"Fork and source-backed PRD prepared; dependency-linked implementation backlog created and checked. Publication verified at session handoff."}}
